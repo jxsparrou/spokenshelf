@@ -52,6 +52,14 @@ Item {
   property double localSessionStartedAt: 0
   property real localTimeListening: 0
   property bool syncingOfflineSessions: false
+  property var offlineSyncCallbacks: []
+  property bool loadingProgress: false
+  property var progressLoadCallbacks: []
+  property int playbackGeneration: 0
+  property bool playbackStartPending: false
+  property bool streamStartPending: false
+  property var unsyncedStreamProgress: ({})
+  property var dirtyStreamProgress: ({})
   property alias playbackVolume: audioOutput.volume
   property double downloadBytes: 0
   property double downloadCompletedBytes: 0
@@ -63,6 +71,7 @@ Item {
   property string downloadServer: ""
   property string downloadToken: ""
   property string downloadUserId: ""
+  property var downloadProgressRecord: null
   property bool loggingOut: false
   property bool promptAfterLogout: false
   property bool clearingCredentials: false
@@ -102,7 +111,7 @@ Item {
   readonly property string stateDirectory: Quickshell.env("HOME") + "/.local/state/omarchy-audiobookshelf"
   readonly property string serverName: server.replace(/^https?:\/\//, "").split("/")[0]
   readonly property bool downloading: downloadProcess.running || downloadTrackIndex >= 0
-  readonly property bool currentDownloaded: currentItem && isDownloaded(currentItem.id)
+  readonly property bool currentDownloaded: currentItem && (localPlayback || isDownloaded(currentItem.id))
   readonly property real downloadProgress: downloadTotalBytes > 0 ? Math.min(downloadBytes / downloadTotalBytes, 1) : 0
   readonly property string downloadProgressLabel: Math.round(downloadProgress * 100) + "% - " + formatBytes(downloadBytes) + " / " + formatBytes(downloadTotalBytes)
 
@@ -127,34 +136,40 @@ Item {
   }
 
   function isDownloaded(itemId) {
-    return offlineBooks[offlineKey(itemId)] !== undefined
+    return offlineEntry(itemId, server, user ? user.id : "") !== null
   }
 
-  function offlineKey(itemId) {
-    return server + "|" + itemId
+  function offlineKey(itemId, itemServer, itemUserId) {
+    return String(itemServer || server) + "|" + String(itemUserId || (user ? user.id : "")) + "|" + itemId
   }
 
-  function offlineEntry(itemId, itemServer) {
-    var scoped = offlineBooks[(itemServer || server) + "|" + itemId]
+  function offlineEntry(itemId, itemServer, itemUserId) {
+    var entryServer = itemServer || server
+    var entryUserId = String(itemUserId || (connected && user ? user.id : ""))
+    var scoped = offlineBooks[offlineKey(itemId, entryServer, entryUserId)]
     if (scoped) return scoped
-    return !connected && !itemServer ? offlineBooks[itemId] || null : null
+    var legacy = offlineBooks[entryServer + "|" + itemId] || (!connected && !itemServer ? offlineBooks[itemId] : null)
+    if (legacy && (entryUserId === "" || String(legacy.userId || "") === entryUserId)) return legacy
+    return null
   }
 
   function offlineBookList() {
     var items = []
     for (var id in offlineBooks) {
       var entry = offlineBooks[id]
-      if (!connected || !entry.server || entry.server === server) {
+      if ((!connected || !entry.server || entry.server === server)
+          && (!connected || (entry.userId && user && String(entry.userId) === String(user.id)))) {
         var item = Object.assign({}, entry.item)
         item._spokenShelfServer = entry.server || ""
+        item._spokenShelfUserId = entry.userId || ""
         items.push(item)
       }
     }
     return items
   }
 
-  function downloadDirectory(itemId, itemServer) {
-    var value = String(itemServer || server)
+  function downloadDirectory(itemId, itemServer, itemUserId) {
+    var value = String(itemServer || server) + "|" + String(itemUserId || (user ? user.id : ""))
     var hash = 2166136261
     for (var i = 0; i < value.length; i++) hash = Math.imul(hash ^ value.charCodeAt(i), 16777619)
     return stateDirectory + "/downloads/" + (hash >>> 0).toString(16) + "/" + safeItemId(itemId)
@@ -165,8 +180,10 @@ Item {
     var changed = false
     for (var key in entries) {
       var entry = entries[key]
-      if (key.indexOf("|") === -1 && entry && entry.server && entry.item && entry.item.id) {
-        migrated[entry.server + "|" + entry.item.id] = entry
+      var scopedKey = entry && entry.server && entry.item && entry.item.id
+        ? entry.server + "|" + String(entry.userId || "") + "|" + entry.item.id : key
+      if (scopedKey !== key) {
+        migrated[scopedKey] = entry
         changed = true
       } else {
         migrated[key] = entry
@@ -272,7 +289,7 @@ Item {
   }
 
   function request(method, path, body, callback) {
-    requestQueue.push({ method: method, path: path, body: body, callback: callback })
+    requestQueue.push({ method: method, path: path, body: body, callback: callback, server: server, token: token })
     runNextRequest()
   }
 
@@ -280,11 +297,11 @@ Item {
     if (apiProcess.running || requestQueue.length === 0) return
     activeRequest = requestQueue.shift()
     requestOutputHandled = false
-    apiProcess.payload = token + "\n" + (activeRequest.body !== null && activeRequest.body !== undefined ? JSON.stringify(activeRequest.body) : "") + "\n"
+    apiProcess.payload = activeRequest.token + "\n" + (activeRequest.body !== null && activeRequest.body !== undefined ? JSON.stringify(activeRequest.body) : "") + "\n"
     apiProcess.command = [
       "sh", "-c",
-      "set -eu; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; chmod 700 \"$tmp\"; IFS= read -r token; IFS= read -r body; printf '%s\\n' 'Accept: application/json' > \"$tmp/headers\"; if [ -n \"$token\" ]; then printf 'Authorization: Bearer %s\\n' \"$token\" >> \"$tmp/headers\"; fi; if [ -n \"$body\" ]; then printf '%s' \"$body\" > \"$tmp/body\"; chmod 600 \"$tmp/body\"; curl --silent --show-error --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --header 'Content-Type: application/json' --data-binary @\"$tmp/body\" --write-out '\\n%{http_code}'; else curl --silent --show-error --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --write-out '\\n%{http_code}'; fi",
-      "spokenshelf-api", activeRequest.method, apiUrl(activeRequest.path)
+      "set -eu; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; chmod 700 \"$tmp\"; IFS= read -r token; IFS= read -r body; printf '%s\\n' 'Accept: application/json' > \"$tmp/headers\"; if [ -n \"$token\" ]; then printf 'Authorization: Bearer %s\\n' \"$token\" >> \"$tmp/headers\"; fi; if [ -n \"$body\" ]; then printf '%s' \"$body\" > \"$tmp/body\"; chmod 600 \"$tmp/body\"; curl --silent --show-error --connect-timeout 3 --max-time 10 --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --header 'Content-Type: application/json' --data-binary @\"$tmp/body\" --write-out '\\n%{http_code}'; else curl --silent --show-error --connect-timeout 3 --max-time 10 --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --write-out '\\n%{http_code}'; fi",
+      "spokenshelf-api", activeRequest.method, activeRequest.server + activeRequest.path
     ]
     apiProcess.running = true
   }
@@ -512,6 +529,14 @@ Item {
     searching = false
     libraryLoading = false
     librarySearchIndex = []
+    playbackGeneration += 1
+    playbackStartPending = false
+    streamStartPending = false
+    unsyncedStreamProgress = ({})
+    dirtyStreamProgress = ({})
+    offlineSyncCallbacks = []
+    loadingProgress = false
+    progressLoadCallbacks = []
     mediaProgress = ({})
     selectedLibraryId = ""
     currentItem = null
@@ -605,13 +630,96 @@ Item {
     })
   }
 
-  function loadProgress() {
+  function loadProgress(callback) {
+    if (callback) progressLoadCallbacks = progressLoadCallbacks.concat([callback])
+    if (loadingProgress) return
+    loadingProgress = true
+    var requestServer = server
+    var requestUserId = user ? String(user.id || "") : ""
     request("GET", "/api/me/progress", null, function(ok, data) {
-      if (!ok) return
-      var next = ({})
-      var records = data.mediaProgress || []
-      for (var i = 0; i < records.length; i++) next[records[i].libraryItemId] = records[i]
-      mediaProgress = next
+      loadingProgress = false
+      var sameAccount = server === requestServer && user && String(user.id || "") === requestUserId
+      if (ok && sameAccount) {
+        var next = ({})
+        var records = data.mediaProgress || []
+        for (var i = 0; i < records.length; i++) next[records[i].libraryItemId] = records[i]
+        next = reconcileDownloadedProgress(next, requestServer, requestUserId)
+        next = reconcileDirtyStreamProgress(next, requestServer, requestUserId)
+        mediaProgress = next
+      }
+      var callbacks = progressLoadCallbacks.slice()
+      progressLoadCallbacks = []
+      for (var j = 0; j < callbacks.length; j++) callbacks[j](ok && sameAccount)
+    })
+  }
+
+  function reconcileDownloadedProgress(records, progressServer, progressUserId) {
+    var downloads = Object.assign({}, offlineBooks)
+    var changed = false
+    for (var key in downloads) {
+      var entry = downloads[key]
+      if (!entry || entry.server !== progressServer || String(entry.userId || "") !== progressUserId || !entry.item) continue
+      var local = entry.progress || null
+      for (var i = 0; i < queuedSessions.length; i++) {
+        var queued = queuedSessions[i]
+        if (queued.serverUrl === progressServer && String(queued.userId || "") === progressUserId && queued.libraryItemId === entry.item.id
+            && (!local || Number(queued.updatedAt || 0) > Number(local.lastUpdate || local.updatedAt || 0))) {
+          local = {
+            libraryItemId: queued.libraryItemId, duration: queued.duration, currentTime: queued.currentTime,
+            progress: Api.progressFor(queued.currentTime, queued.duration), isFinished: Number(queued.currentTime || 0) >= Number(queued.duration || 0) * 0.995,
+            lastUpdate: queued.updatedAt
+          }
+        }
+      }
+      var remote = records[entry.item.id] || null
+      if (local && (!remote || Number(local.lastUpdate || local.updatedAt || 0) > Number(remote.lastUpdate || remote.updatedAt || 0))) {
+        records[entry.item.id] = local
+      } else if (remote) {
+        downloads[key] = Object.assign({}, entry, { progress: Object.assign({}, remote) })
+        changed = true
+      }
+    }
+    if (downloadItem && downloadServer === progressServer && String(downloadUserId || "") === progressUserId && records[downloadItem.id]) {
+      downloadProgressRecord = Object.assign({}, records[downloadItem.id])
+    }
+    if (changed) {
+      offlineBooks = downloads
+      offlineIndex.setText(JSON.stringify(downloads, null, 2) + "\n")
+    }
+    return records
+  }
+
+  function reconcileDirtyStreamProgress(records, progressServer, progressUserId) {
+    var prefix = streamProgressKey("", progressServer, progressUserId)
+    for (var key in dirtyStreamProgress) {
+      if (key.indexOf(prefix) === 0) {
+        var dirty = dirtyStreamProgress[key]
+        records[dirty.libraryItemId] = dirty
+      }
+    }
+    return records
+  }
+
+  function refreshProgress(itemServer, itemUserId, callback) {
+    var targetServer = String(itemServer || server)
+    var targetUserId = String(itemUserId || "")
+    if (!connected || targetServer !== server || targetUserId === "" || !user || targetUserId !== String(user.id || "")) {
+      if (callback) callback(false)
+      return
+    }
+    syncOfflineSessions(function(ok) {
+      if (!ok || targetServer !== server || !user || targetUserId !== String(user.id || "")) {
+        if (callback) callback(false)
+        return
+      }
+      loadProgress(callback)
+    })
+  }
+
+  function refreshVisibleProgress() {
+    if (isPlaying) return
+    refreshProgress(server, user ? user.id : "", function(ok) {
+      if (ok && selectedLibraryId !== "") loadHome(selectedLibraryId)
     })
   }
 
@@ -680,7 +788,12 @@ Item {
   }
 
   function playItem(item) {
+    if (streamStartPending) return
+    playbackGeneration += 1
+    playbackStartPending = false
+    streamStartPending = true
     if (currentItem) syncProgress(true)
+    player.pause()
     loading = true
     request("POST", "/api/items/" + encodeURIComponent(item.id) + "/play", {
       deviceInfo: { deviceId: "spokenshelf", clientName: "SpokenShelf", clientVersion: "1.0.0" },
@@ -689,8 +802,9 @@ Item {
       forceTranscode: false,
       mediaPlayer: "QtMultimedia"
     }, function(ok, data) {
+      streamStartPending = false
       loading = false
-      if (!ok) { error = data; return }
+      if (!ok) { sessionId = ""; error = data; return }
       currentItem = data.libraryItem || item
       currentTracks = data.audioTracks || data.mediaTracks || []
       currentChapters = data.chapters || []
@@ -699,7 +813,19 @@ Item {
       playbackStartedAt = Number(data.startedAt || Date.now())
       localPlayback = false
       if (currentTracks.length === 0) { error = "The server did not return playable audio tracks"; return }
-      startAt(data.currentTime || 0)
+      var progressKey = streamProgressKey(currentItem.id, server, user ? user.id : "")
+      var unsynced = unsyncedStreamProgress[progressKey] || null
+      var dirty = dirtyStreamProgress[progressKey] || null
+      if (unsynced) {
+        listenedSinceSync = Number(unsynced.timeListened || 0)
+        var remaining = Object.assign({}, unsyncedStreamProgress)
+        delete remaining[progressKey]
+        unsyncedStreamProgress = remaining
+      } else {
+        listenedSinceSync = 0
+      }
+      startAt(unsynced && unsynced.currentTime !== null ? unsynced.currentTime
+              : (dirty ? dirty.currentTime : (data.currentTime || 0)))
     })
   }
 
@@ -732,14 +858,43 @@ Item {
   }
 
   function togglePlayback() {
+    if (streamStartPending) return
     if (isPlaying) {
       player.pause()
       syncProgress(false)
+    } else if (playbackStartPending) {
+      playbackGeneration += 1
+      playbackStartPending = false
+      loading = false
     } else {
-      player.play()
+      var item = currentItem
+      if (!item) return
+      playbackGeneration += 1
+      var generation = playbackGeneration
+      playbackStartPending = true
+      var itemServer = localPlayback ? localSessionServer : server
+      var itemUserId = localPlayback ? localSessionUserId : (user ? user.id : "")
+      refreshProgress(itemServer, itemUserId, function(ok) {
+        if (generation !== playbackGeneration || currentItem !== item || isPlaying) return
+        playbackStartPending = false
+        if (ok) seekToSavedProgress(item.id)
+        player.play()
+      })
     }
   }
-  function seek(seconds) {
+
+  function seekToSavedProgress(itemId) {
+    var saved = progressForItem(itemId)
+    if (!saved) return
+    var target = saved.isFinished ? 0 : Number(saved.currentTime || 0)
+    if (isFinite(target) && Math.abs(target - position) > 1) seek(target, true)
+  }
+  function seek(seconds, preservePendingPlayback) {
+    if (playbackStartPending && !preservePendingPlayback) {
+      playbackGeneration += 1
+      playbackStartPending = false
+      loading = false
+    }
     var target = Math.max(0, Math.min(duration, seconds))
     for (var i = 0; i < currentTracks.length; i++) {
       var track = currentTracks[i]
@@ -755,8 +910,8 @@ Item {
   function skip(seconds) { seek(position + seconds) }
   function seekChapter(seconds) { seek(chapterStart + Math.max(0, Math.min(chapterDuration, seconds))) }
 
-  function syncProgress(finalSync) {
-    if (!currentItem || duration <= 0) return
+  function syncProgress(finalSync, callback) {
+    if (!currentItem || duration <= 0) { if (callback) callback(false); return }
     var now = Date.now()
     var progress = Api.progressFor(position, duration)
     var payload = { duration: duration, currentTime: position, progress: progress, isFinished: progress >= 0.995,
@@ -764,19 +919,63 @@ Item {
     var nextProgress = Object.assign({}, mediaProgress)
     nextProgress[currentItem.id] = Object.assign({}, nextProgress[currentItem.id] || {}, payload, { libraryItemId: currentItem.id, lastUpdate: now })
     mediaProgress = nextProgress
+    if (downloadItem && downloadItem.id === currentItem.id && downloadServer === server
+        && String(downloadUserId || "") === String(user ? user.id || "" : "")) {
+      downloadProgressRecord = Object.assign({}, nextProgress[currentItem.id])
+    }
     if (localPlayback) {
       queueOfflineSession(payload, now)
-      if (connected && !loggingOut) syncOfflineSessions()
+      if (connected && !loggingOut) syncOfflineSessions(callback)
+      else if (callback) callback(false)
       return
     }
     if (sessionId !== "") {
+      var syncedItem = currentItem
+      var syncedSessionId = sessionId
+      var syncedListening = listenedSinceSync
+      var syncedServer = server
+      var syncedUserId = user ? user.id : ""
+      var syncedPosition = position
       request("POST", "/api/session/" + encodeURIComponent(sessionId) + (finalSync ? "/close" : "/sync"),
-              { currentTime: position, duration: duration, timeListened: listenedSinceSync }, function() {})
+              { currentTime: position, duration: duration, timeListened: syncedListening }, function(ok) {
+                var progressKey = streamProgressKey(syncedItem.id, syncedServer, syncedUserId)
+                if (ok) {
+                  var clean = Object.assign({}, dirtyStreamProgress)
+                  delete clean[progressKey]
+                  dirtyStreamProgress = clean
+                } else {
+                  var dirty = Object.assign({}, dirtyStreamProgress)
+                  dirty[progressKey] = Object.assign({}, nextProgress[syncedItem.id])
+                  dirtyStreamProgress = dirty
+                }
+                if (!ok && !finalSync && currentItem === syncedItem && sessionId === syncedSessionId && !streamStartPending) {
+                  listenedSinceSync += syncedListening
+                } else if (!ok) {
+                  stashUnsyncedStreamProgress(syncedItem.id, syncedServer, syncedUserId,
+                                              finalSync ? syncedPosition : null, syncedListening)
+                }
+                if (callback) callback(ok)
+              })
       listenedSinceSync = 0
     } else {
       request("PATCH", "/api/me/progress/" + encodeURIComponent(currentItem.id),
-              { duration: duration, currentTime: position, progress: progress }, function() {})
+              { duration: duration, currentTime: position, progress: progress }, function(ok) { if (callback) callback(ok) })
     }
+  }
+
+  function streamProgressKey(itemId, itemServer, itemUserId) {
+    return String(itemServer || "") + "|" + String(itemUserId || "") + "|" + String(itemId || "")
+  }
+
+  function stashUnsyncedStreamProgress(itemId, itemServer, itemUserId, currentTime, timeListened) {
+    var key = streamProgressKey(itemId, itemServer, itemUserId)
+    var existing = unsyncedStreamProgress[key] || ({ currentTime: null, timeListened: 0 })
+    var failed = Object.assign({}, unsyncedStreamProgress)
+    failed[key] = {
+      currentTime: currentTime !== null ? currentTime : existing.currentTime,
+      timeListened: Number(existing.timeListened || 0) + Number(timeListened || 0)
+    }
+    unsyncedStreamProgress = failed
   }
 
   function downloadBook() {
@@ -789,6 +988,7 @@ Item {
     downloadServer = server
     downloadToken = token
     downloadUserId = user ? user.id : ""
+    downloadProgressRecord = progressForItem(itemId) ? Object.assign({}, progressForItem(itemId)) : null
     downloadStatus = "Downloading " + title
     downloadBytes = 0
     downloadCompletedBytes = 0
@@ -805,9 +1005,10 @@ Item {
     if (!downloadItem) return
     if (downloadTrackIndex >= downloadTracks.length) {
       var next = Object.assign({}, offlineBooks)
-      next[downloadServer + "|" + downloadItem.id] = {
+      next[offlineKey(downloadItem.id, downloadServer, downloadUserId)] = {
         server: downloadServer, userId: downloadUserId, item: downloadItem,
-        tracks: downloadTracks, chapters: downloadChapters
+        tracks: downloadTracks, chapters: downloadChapters,
+        progress: downloadProgressRecord
       }
       offlineBooks = next
       offlineIndex.setText(JSON.stringify(offlineBooks, null, 2) + "\n")
@@ -816,6 +1017,7 @@ Item {
       downloadPath = ""
       downloadTrackIndex = -1
       downloadItem = null
+      downloadProgressRecord = null
       downloadTracks = []
       downloadChapters = []
       downloadServer = ""
@@ -830,6 +1032,7 @@ Item {
       error = "Download rejected an unsafe server response"
       downloadTrackIndex = -1
       downloadItem = null
+      downloadProgressRecord = null
       downloadTracks = []
       downloadChapters = []
       downloadServer = ""
@@ -837,17 +1040,35 @@ Item {
       downloadUserId = ""
       return
     }
-    var destination = downloadDirectory(itemId, downloadServer) + "/" + downloadTrackIndex + ".audio"
+    var destination = downloadDirectory(itemId, downloadServer, downloadUserId) + "/" + downloadTrackIndex + ".audio"
     downloadPath = destination
     downloadProcess.payload = downloadToken + "\n"
     downloadProcess.command = ["sh", "-c", "set -eu; umask 077; IFS= read -r token; mkdir -p \"$(dirname \"$1\")\"; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; chmod 600 \"$tmp\"; printf 'Authorization: Bearer %s\\n' \"$token\" > \"$tmp\"; curl --fail --silent --show-error --continue-at - --output \"$1\" --header @\"$tmp\" --url \"$2\"", "spokenshelf-download", destination, url]
     downloadProcess.running = true
   }
 
-  function playOffline(itemId, itemServer) {
-    var saved = offlineEntry(itemId, itemServer)
+  function playOffline(itemId, itemServer, itemUserId) {
+    if (streamStartPending) return
+    var saved = offlineEntry(itemId, itemServer, itemUserId)
     if (!saved) return
+    streamStartPending = true
     if (currentItem) syncProgress(true)
+    player.pause()
+    loading = false
+    playbackGeneration += 1
+    var generation = playbackGeneration
+    playbackStartPending = true
+    var savedServer = saved.server || itemServer || server
+    var savedUserId = saved.userId || ""
+    refreshProgress(savedServer, savedUserId, function(ok) {
+      if (generation !== playbackGeneration) return
+      playbackStartPending = false
+      streamStartPending = false
+      startOfflinePlayback(saved, savedServer, savedUserId)
+    })
+  }
+
+  function startOfflinePlayback(saved, savedServer, savedUserId) {
     if (saved.server) selectServer(saved.server)
     currentItem = saved.item
     currentTracks = saved.tracks
@@ -857,14 +1078,34 @@ Item {
     sessionDuration = Number(saved.item.media.duration || 0)
     playbackStartedAt = Date.now()
     localSessionId = newUuid()
-    localSessionServer = saved.server || itemServer || server
-    localSessionUserId = saved.userId || ""
-    var savedProgress = progressForItem(itemId)
+    localSessionServer = savedServer
+    localSessionUserId = savedUserId
+    var savedProgress = progressForOfflineEntry(saved, savedServer, savedUserId)
     var resumeTime = savedProgress && !savedProgress.isFinished ? Number(savedProgress.currentTime || 0) : 0
     localSessionStartTime = resumeTime
     localSessionStartedAt = playbackStartedAt
     localTimeListening = 0
     startAt(resumeTime)
+  }
+
+  function progressForOfflineEntry(saved, savedServer, savedUserId) {
+    var latest = saved.progress || null
+    for (var i = 0; i < queuedSessions.length; i++) {
+      var queued = queuedSessions[i]
+      if (queued.serverUrl === savedServer && String(queued.userId || "") === savedUserId && queued.libraryItemId === saved.item.id
+          && (!latest || Number(queued.updatedAt || 0) > Number(latest.lastUpdate || latest.updatedAt || 0))) {
+        latest = {
+          libraryItemId: queued.libraryItemId, duration: queued.duration, currentTime: queued.currentTime,
+          progress: Api.progressFor(queued.currentTime, queued.duration), isFinished: Number(queued.currentTime || 0) >= Number(queued.duration || 0) * 0.995,
+          lastUpdate: queued.updatedAt
+        }
+      }
+    }
+    if (connected && server === savedServer && user && String(user.id || "") === savedUserId) {
+      var serverProgress = progressForItem(saved.item.id)
+      if (serverProgress && (!latest || Number(serverProgress.lastUpdate || 0) >= Number(latest.lastUpdate || latest.updatedAt || 0))) latest = serverProgress
+    }
+    return latest
   }
 
   function showOfflineBooks() {
@@ -906,42 +1147,82 @@ Item {
     if (!replaced) next.push(session)
     queuedSessions = next
     offlineSessionsFile.setText(JSON.stringify(queuedSessions, null, 2) + "\n")
+    var key = offlineKey(currentItem.id, localSessionServer, localSessionUserId)
+    if (offlineBooks[key]) {
+      var downloads = Object.assign({}, offlineBooks)
+      downloads[key] = Object.assign({}, downloads[key], {
+        progress: Object.assign({}, progress, { libraryItemId: currentItem.id, lastUpdate: timestamp })
+      })
+      offlineBooks = downloads
+      offlineIndex.setText(JSON.stringify(offlineBooks, null, 2) + "\n")
+    }
     listenedSinceSync = 0
   }
 
-  function syncOfflineSessions() {
-    if (queuedSessions.length === 0 || syncingOfflineSessions) return
+  function syncOfflineSessions(callback) {
+    if (callback) offlineSyncCallbacks = offlineSyncCallbacks.concat([callback])
+    if (syncingOfflineSessions) return
+    if (queuedSessions.length === 0) { finishOfflineSessionSync(true); return }
     syncingOfflineSessions = true
+    var syncServer = server
+    var syncUserId = user ? String(user.id || "") : ""
     var sent = []
     for (var index = 0; index < queuedSessions.length; index++) {
       var queued = queuedSessions[index]
-      if (queued.serverUrl === server && user && queued.userId && queued.userId === user.id) {
+      if (queued.serverUrl === syncServer && syncUserId !== "" && String(queued.userId || "") === syncUserId) {
         sent.push(Object.assign({}, queued, {
           deviceInfo: { deviceId: "spokenshelf", clientName: "SpokenShelf", clientVersion: "1.0.0" }
         }))
       }
     }
-    if (sent.length === 0) { syncingOfflineSessions = false; return }
+    if (sent.length === 0) {
+      syncingOfflineSessions = false
+      finishOfflineSessionSync(true)
+      return
+    }
     request("POST", "/api/session/local-all", {
       deviceInfo: { deviceId: "spokenshelf", clientName: "SpokenShelf", clientVersion: "1.0.0" },
       sessions: sent
     }, function(ok, data) {
       syncingOfflineSessions = false
-      if (!ok) return
+      if (!ok) { finishOfflineSessionSync(false); return }
       var results = data.sessions || data.results || []
       var remaining = []
+      var allSynced = true
+      var activeSessionSynced = false
+      var activeSentSession = null
       for (var i = 0; i < queuedSessions.length; i++) {
         var current = queuedSessions[i]
         var sentSession = null
         var result = null
-        if (current.serverUrl !== server || !user || !current.userId || current.userId !== user.id) { remaining.push(current); continue }
+        if (current.serverUrl !== syncServer || String(current.userId || "") !== syncUserId) { remaining.push(current); continue }
         for (var j = 0; j < sent.length; j++) if (sent[j].id === current.id) { sentSession = sent[j]; break }
         for (var k = 0; k < results.length; k++) if (results[k].id === current.id) { result = results[k]; break }
-        if (!sentSession || !result || !result.success || current.updatedAt > sentSession.updatedAt) remaining.push(current)
+        if (!sentSession || !result || !result.success || current.updatedAt > sentSession.updatedAt) {
+          remaining.push(current)
+          allSynced = false
+        } else if (current.id === localSessionId) {
+          activeSessionSynced = true
+          activeSentSession = sentSession
+        }
       }
       queuedSessions = remaining
       offlineSessionsFile.setText(JSON.stringify(queuedSessions, null, 2) + "\n")
+      if (activeSessionSynced && localPlayback && localSessionServer === syncServer && localSessionUserId === syncUserId) {
+        var listeningAfterSnapshot = Math.max(0, localTimeListening - Number(activeSentSession.timeListening || 0))
+        localSessionId = newUuid()
+        localSessionStartTime = Number(activeSentSession.currentTime || position)
+        localSessionStartedAt = Date.now() - listeningAfterSnapshot * 1000
+        localTimeListening = listeningAfterSnapshot
+      }
+      finishOfflineSessionSync(allSynced)
     })
+  }
+
+  function finishOfflineSessionSync(ok) {
+    var callbacks = offlineSyncCallbacks.slice()
+    offlineSyncCallbacks = []
+    for (var i = 0; i < callbacks.length; i++) callbacks[i](ok)
   }
 
   MediaPlayer {
@@ -1125,13 +1406,13 @@ Item {
 
     function play(): string {
       if (!root.currentItem) return "unhandled"
-      if (!root.isPlaying) root.togglePlayback()
+      if (!root.isPlaying && !root.playbackStartPending) root.togglePlayback()
       return "ok"
     }
 
     function pause(): string {
       if (!root.currentItem) return "unhandled"
-      if (root.isPlaying) root.togglePlayback()
+      if (root.isPlaying || root.playbackStartPending) root.togglePlayback()
       return "ok"
     }
 
@@ -1171,6 +1452,7 @@ Item {
         root.downloadStatus = "Download failed: " + String(downloadError.text || "unknown error").trim()
         root.downloadTrackIndex = -1
         root.downloadItem = null
+        root.downloadProgressRecord = null
         root.downloadTracks = []
         root.downloadChapters = []
         root.downloadServer = ""
@@ -1180,7 +1462,7 @@ Item {
       }
       var tracks = root.downloadTracks.slice()
       var track = Object.assign({}, tracks[root.downloadTrackIndex])
-      track.localPath = root.downloadDirectory(root.downloadItem.id, root.downloadServer) + "/" + root.downloadTrackIndex + ".audio"
+      track.localPath = root.downloadDirectory(root.downloadItem.id, root.downloadServer, root.downloadUserId) + "/" + root.downloadTrackIndex + ".audio"
       tracks[root.downloadTrackIndex] = track
       root.downloadTracks = tracks
       root.downloadCompletedBytes += Number(track.metadata && track.metadata.size ? track.metadata.size : track.bitRate * track.duration / 8 || 0)

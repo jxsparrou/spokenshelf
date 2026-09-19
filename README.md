@@ -80,6 +80,7 @@ Username and password credentials are sent only to the configured server's `/log
 - **Library** lists all books and supports title, author, and series search.
 - **Offline** lists downloaded books.
 - Selecting a downloaded book from any page prefers its local audio file.
+- Progress refreshes from the server when the panel opens and before playback resumes. Downloaded books upload queued offline listening before applying server progress when connected.
 - **Playing** provides book and chapter seeking, transport controls, volume, source status, and downloads.
 - Hardware play/pause keys work through MPRIS while SpokenShelf has a loaded book.
 - Use **Log out** in the panel header to forget the current server credentials and connect to another server. Downloads are kept.

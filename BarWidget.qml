@@ -14,7 +14,7 @@ BarWidget {
   function close() { popupOpen = false }
   function playBook(book, offline) {
     if (!service || !book) return
-    if (offline || service.isDownloaded(book.id)) service.playOffline(book.id, book._spokenShelfServer || "")
+    if (offline || service.isDownloaded(book.id)) service.playOffline(book.id, book._spokenShelfServer || "", book._spokenShelfUserId || "")
     else service.playItem(book)
     page = "player"
   }
@@ -34,6 +34,7 @@ BarWidget {
       if (!root.service) return
       var opening = !root.popupOpen
       root.popupOpen = opening
+      if (opening && root.service.connected) root.service.refreshVisibleProgress()
       if (opening && !root.service.connected) {
         var hasDownloads = Object.keys(root.service.offlineBooks).length > 0
         root.page = hasDownloads ? "offline" : "home"
