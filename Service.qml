@@ -75,6 +75,10 @@ Item {
   property string downloadToken: ""
   property string downloadUserId: ""
   property var downloadProgressRecord: null
+  property var pendingDeletion: null
+  property string downloadProcessError: ""
+  property double downloadCurrentBytes: 0
+  property string deleteProcessError: ""
   property bool loggingOut: false
   property bool promptAfterLogout: false
   property bool clearingCredentials: false
@@ -89,6 +93,20 @@ Item {
   property string dependencyWarning: ""
   property string selectedAudioOutputId: ""
   property var audioOutputOptions: []
+  property bool pythonAvailable: false
+  property bool pythonChecked: false
+  property bool mediaProxyReady: false
+  property int mediaProxyPort: 0
+  property string mediaProxyCapability: ""
+  property bool stoppingMediaProxy: false
+  property int mediaProxyFailureCount: 0
+  property int pendingProxyTrackIndex: -1
+  property real pendingProxySeekSeconds: 0
+  property bool pendingProxyShouldPlay: false
+  property string pendingOfflineItemId: ""
+  property string pendingOfflineServer: ""
+  property string pendingOfflineUserId: ""
+  property bool stateReady: false
 
   signal credentialPromptStarting()
   signal credentialPromptUnavailable()
@@ -114,6 +132,7 @@ Item {
   readonly property int chapterNumber: currentChapter ? currentChapters.indexOf(currentChapter) + 1 : 0
   readonly property real bookProgress: duration > 0 ? Math.max(0, Math.min(1, position / duration)) : 0
   readonly property string stateDirectory: Quickshell.env("HOME") + "/.local/state/omarchy-audiobookshelf"
+  readonly property string transportPath: Qt.resolvedUrl("transport.py").toString().replace(/^file:\/\//, "")
   readonly property string serverName: server.replace(/^https?:\/\//, "").split("/")[0]
   readonly property bool downloading: downloadProcess.running || downloadTrackIndex >= 0
   readonly property bool currentDownloaded: currentItem && (localPlayback || isDownloaded(currentItem.id))
@@ -141,7 +160,8 @@ Item {
   }
 
   function isDownloaded(itemId) {
-    return offlineEntry(itemId, server, user ? user.id : "") !== null
+    var entry = offlineEntry(itemId, server, user ? user.id : "")
+    return entry !== null && !entry.partial
   }
 
   function offlineKey(itemId, itemServer, itemUserId) {
@@ -167,6 +187,7 @@ Item {
         var item = Object.assign({}, entry.item)
         item._spokenShelfServer = entry.server || ""
         item._spokenShelfUserId = entry.userId || ""
+        item._spokenShelfPartial = !!entry.partial
         items.push(item)
       }
     }
@@ -200,7 +221,7 @@ Item {
 
   function safeItemId(itemId) {
     var value = String(itemId || "")
-    return /^[A-Za-z0-9._-]+$/.test(value) ? value : ""
+    return value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/.test(value) ? value : ""
   }
 
   function trustedMediaUrl(contentUrl, expectedServer) {
@@ -208,6 +229,51 @@ Item {
     var origin = expectedServer || server
     if (value.indexOf("http") !== 0) return origin + value
     return value === origin || value.indexOf(origin + "/") === 0 ? value : ""
+  }
+
+  function startMediaProxy() {
+    if (token === "" || server === "" || mediaProxyProcess.running) return
+    mediaProxyReady = false
+    mediaProxyPort = 0
+    mediaProxyCapability = ""
+    stoppingMediaProxy = false
+    mediaProxyProcess.payload = JSON.stringify({ server: server, token: token }) + "\n"
+    mediaProxyProcess.command = ["python", transportPath, "proxy"]
+    mediaProxyProcess.running = true
+  }
+
+  function stopMediaProxy() {
+    mediaProxyReady = false
+    mediaProxyPort = 0
+    mediaProxyCapability = ""
+    stoppingMediaProxy = true
+    mediaProxyRestart.stop()
+    if (mediaProxyProcess.running) mediaProxyProcess.running = false
+  }
+
+  function handleMediaProxyReady(line) {
+    var data = null
+    try { data = JSON.parse(String(line || "")) } catch (_) { return }
+    var port = Number(data.port || 0)
+    var capability = String(data.capability || "")
+    if (!mediaProxyProcess.running || port < 1 || port > 65535 || !/^[A-Za-z0-9_-]{32,}$/.test(capability)) return
+    mediaProxyPort = port
+    mediaProxyCapability = capability
+    mediaProxyReady = true
+    mediaProxyStable.restart()
+    if (pendingProxyTrackIndex >= 0) {
+      var index = pendingProxyTrackIndex
+      var seconds = pendingProxySeekSeconds
+      var shouldPlay = pendingProxyShouldPlay
+      pendingProxyTrackIndex = -1
+      startTrack(index, seconds, shouldPlay)
+    }
+  }
+
+  function mediaProxyUrl(upstreamUrl) {
+    if (!mediaProxyReady) return ""
+    return "http://127.0.0.1:" + mediaProxyPort + "/" + mediaProxyCapability
+      + "/media?url=" + encodeURIComponent(upstreamUrl)
   }
 
   function chapterFor(seconds) {
@@ -225,11 +291,15 @@ Item {
 
   function chaptersFromTracks(tracks) {
     var chapters = []
-    for (var i = 0; i < tracks.length; i++) {
+    if (!Array.isArray(tracks)) return chapters
+    for (var i = 0; i < Math.min(tracks.length, 10000); i++) {
       var track = tracks[i]
-      var trackChapters = track.metadata && track.metadata.chapters ? track.metadata.chapters : (track.chapters || [])
+      if (!track || typeof track !== "object") continue
+      var nested = track.metadata && track.metadata.chapters ? track.metadata.chapters : track.chapters
+      var trackChapters = Array.isArray(nested) ? nested : []
       var offset = Number(track.startOffset || 0)
-      for (var j = 0; j < trackChapters.length; j++) {
+      for (var j = 0; j < trackChapters.length && chapters.length < 10000; j++) {
+        if (!trackChapters[j] || typeof trackChapters[j] !== "object") continue
         var chapter = Object.assign({}, trackChapters[j])
         chapter.start = Number(chapter.start || 0) + offset
         chapter.end = Number(chapter.end || 0) + offset
@@ -249,6 +319,13 @@ Item {
 
   function formatDuration(seconds) {
     return Api.secondsLabel(Number(seconds || 0))
+  }
+
+  function updateDependencyError() {
+    var missing = []
+    if (pythonChecked && !pythonAvailable) missing.push("install Python with `omarchy pkg add python`")
+    if (zenityChecked && !zenityAvailable) missing.push("install zenity with `omarchy pkg add zenity`")
+    dependencyError = missing.length > 0 ? "Missing required dependency: " + missing.join("; ") + "." : ""
   }
 
   function setVolume(value) {
@@ -302,12 +379,17 @@ Item {
     if (apiProcess.running || requestQueue.length === 0) return
     activeRequest = requestQueue.shift()
     requestOutputHandled = false
-    apiProcess.payload = activeRequest.token + "\n" + (activeRequest.body !== null && activeRequest.body !== undefined ? JSON.stringify(activeRequest.body) : "") + "\n"
-    apiProcess.command = [
-      "sh", "-c",
-      "set -eu; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; chmod 700 \"$tmp\"; IFS= read -r token; IFS= read -r body; printf '%s\\n' 'Accept: application/json' > \"$tmp/headers\"; if [ -n \"$token\" ]; then printf 'Authorization: Bearer %s\\n' \"$token\" >> \"$tmp/headers\"; fi; if [ -n \"$body\" ]; then printf '%s' \"$body\" > \"$tmp/body\"; chmod 600 \"$tmp/body\"; curl --silent --show-error --connect-timeout 3 --max-time 10 --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --header 'Content-Type: application/json' --data-binary @\"$tmp/body\" --write-out '\\n%{http_code}'; else curl --silent --show-error --connect-timeout 3 --max-time 10 --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --write-out '\\n%{http_code}'; fi",
-      "spokenshelf-api", activeRequest.method, activeRequest.server + activeRequest.path
-    ]
+    apiProcess.payload = JSON.stringify({
+      server: activeRequest.server,
+      url: activeRequest.server + activeRequest.path,
+      token: activeRequest.token,
+      method: activeRequest.method,
+      body: activeRequest.body !== null && activeRequest.body !== undefined ? JSON.stringify(activeRequest.body) : null,
+      maxResponseBytes: 8 * 1024 * 1024,
+      maxRequestBytes: 1024 * 1024,
+      timeout: 10
+    }) + "\n"
+    apiProcess.command = ["python", transportPath, "request"]
     apiProcess.running = true
   }
 
@@ -370,11 +452,17 @@ Item {
     if (loginProcess.running) return
     loading = true
     loginProcess.payload = JSON.stringify({ username: String(username).trim(), password: password })
-    loginProcess.command = [
-      "sh", "-c",
-      "set -eu; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; chmod 600 \"$tmp\"; IFS= read -r body; printf '%s' \"$body\" > \"$tmp\"; curl --silent --show-error --request POST --header 'Accept: application/json' --header 'Content-Type: application/json' --data-binary @\"$tmp\" --write-out '\\n%{http_code}' --url \"$1\"",
-      "spokenshelf-login", server + "/login"
-    ]
+    loginProcess.payload = JSON.stringify({
+      server: server,
+      url: server + "/login",
+      token: "",
+      method: "POST",
+      body: loginProcess.payload,
+      maxResponseBytes: 256 * 1024,
+      maxRequestBytes: 64 * 1024,
+      timeout: 10
+    }) + "\n"
+    loginProcess.command = ["python", transportPath, "request"]
     loginProcess.running = true
   }
 
@@ -406,12 +494,12 @@ Item {
     }
     if (!zenityAvailable) {
       credentialPromptPending = false
-      dependencyError = "Cannot open the connection form: install zenity with `omarchy pkg add zenity`."
+      updateDependencyError()
       credentialPromptUnavailable()
       return
     }
     credentialPromptPending = false
-    dependencyError = ""
+    updateDependencyError()
     credentialPromptStarting()
     credentialPrompt.command = [
       "zenity", "--forms", "--title=SpokenShelf", "--text=Connect to your Audiobookshelf server",
@@ -449,6 +537,8 @@ Item {
       connected = true
       user = data.user || data
       error = ""
+      mediaProxyFailureCount = 0
+      startMediaProxy()
       serverFile.setText(server + "\n")
       if (tokenToStore !== "") {
         tokenStore.payload = tokenToStore
@@ -475,6 +565,7 @@ Item {
     if (currentItem && localPlayback) syncProgress(true)
     else if (currentItem && duration > 0 && token !== "" && server !== "") startLogoutSync()
     player.stop()
+    stopMediaProxy()
     maybeFinishLogout()
   }
 
@@ -496,12 +587,11 @@ Item {
     })
     mediaProgress = nextProgress
     listenedSinceSync = 0
-    logoutSyncProcess.payload = token + "\n" + JSON.stringify(body) + "\n"
-    logoutSyncProcess.command = [
-      "sh", "-c",
-      "set -eu; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; chmod 700 \"$tmp\"; IFS= read -r token; IFS= read -r body; printf 'Authorization: Bearer %s\\n' \"$token\" > \"$tmp/headers\"; printf '%s' \"$body\" > \"$tmp/body\"; chmod 600 \"$tmp/body\"; curl --silent --show-error --connect-timeout 3 --max-time 5 --request \"$1\" --url \"$2\" --header @\"$tmp/headers\" --header 'Content-Type: application/json' --data-binary @\"$tmp/body\" >/dev/null",
-      "spokenshelf-logout-sync", method, apiUrl(path)
-    ]
+    logoutSyncProcess.payload = JSON.stringify({
+      server: server, token: token, method: method, url: path, body: JSON.stringify(body),
+      maxResponseBytes: 65536, maxRequestBytes: 1048576, timeout: 5
+    }) + "\n"
+    logoutSyncProcess.command = ["python", transportPath, "request"]
     logoutSyncProcess.running = true
   }
 
@@ -537,6 +627,11 @@ Item {
     playbackGeneration += 1
     playbackStartPending = false
     streamStartPending = false
+    mediaProxyReady = false
+    mediaProxyPort = 0
+    mediaProxyCapability = ""
+    pendingProxyTrackIndex = -1
+    mediaProxyFailureCount = 0
     pausedAt = 0
     unsyncedStreamProgress = ({})
     dirtyStreamProgress = ({})
@@ -593,9 +688,9 @@ Item {
   function loadLibraries() {
     request("GET", "/api/libraries", null, function(ok, data) {
       if (!ok) { error = data; return }
-      libraries = data.libraries || []
+      libraries = data && Array.isArray(data.libraries) ? data.libraries.slice(0, 100) : []
       for (var i = 0; i < libraries.length; i++) {
-        if (libraries[i].mediaType === "book") { loadLibrary(libraries[i].id); return }
+        if (libraries[i] && libraries[i].mediaType === "book") { loadLibrary(libraries[i].id); return }
       }
       if (libraries.length > 0) error = "No audiobook library is available"
     })
@@ -609,29 +704,66 @@ Item {
     libraryLoading = true
     librarySearchIndex = []
     loading = true
-    request("GET", "/api/libraries/" + encodeURIComponent(id) + "/items?mediaType=book&sort=media.metadata.title&limit=0", null, function(ok, data) {
-      if (id !== selectedLibraryId) return
+    loadLibraryPage(id, 0, [], 0)
+    loadHome(id)
+    loadProgress()
+  }
+
+  function loadLibraryPage(id, page, collected, collectedCharacters) {
+    var pageSize = 100
+    var maxItems = 10000
+    if (page * pageSize >= maxItems) {
       loading = false
       libraryLoading = false
-      if (!ok) { searching = false; error = data; return }
-      libraryBooks = data.results || []
+      libraryBooks = collected
+      rebuildLibrarySearchIndex()
+      books = libraryBooks
+      error = "Library loading stopped at the 10,000-book safety limit"
+      return
+    }
+    request("GET", "/api/libraries/" + encodeURIComponent(id) + "/items?mediaType=book&sort=media.metadata.title&minified=1&limit=" + pageSize + "&page=" + page, null, function(ok, data) {
+      if (id !== selectedLibraryId) return
+      if (!ok) { loading = false; libraryLoading = false; searching = false; error = data; return }
+      var results = data && Array.isArray(data.results) ? data.results : []
+      if (results.length > pageSize) {
+        loading = false
+        libraryLoading = false
+        error = "The server returned an oversized library page"
+        return
+      }
+      var nextCharacters = collectedCharacters + JSON.stringify(results).length
+      if (nextCharacters > 16 * 1024 * 1024) {
+        loading = false
+        libraryLoading = false
+        error = "Library loading stopped at the metadata safety limit"
+        return
+      }
+      var next = collected.concat(results)
+      var hasTotal = data && data.total !== undefined && data.total !== null
+      var total = hasTotal ? Math.min(maxItems, Math.max(0, Number(data.total))) : maxItems
+      if (results.length === pageSize && next.length < total) {
+        loadLibraryPage(id, page + 1, next, nextCharacters)
+        return
+      }
+      loading = false
+      libraryLoading = false
+      libraryBooks = next
       rebuildLibrarySearchIndex()
       books = libraryBooks
       if (searchQuery !== "") searchLibrary(searchQuery)
     })
-    loadHome(id)
-    loadProgress()
   }
 
   function loadHome(id) {
     request("GET", "/api/libraries/" + encodeURIComponent(id) + "/personalized?limit=8", null, function(ok, data) {
       if (!ok) { error = data; return }
-      var shelves = Array.isArray(data) ? data : []
+      var shelves = Array.isArray(data) ? data.slice(0, 100) : []
       var inProgress = []
       var recent = []
       for (var i = 0; i < shelves.length; i++) {
-        if (shelves[i].id === "continue-listening") inProgress = shelves[i].entities || []
-        else if (shelves[i].id === "recently-added") recent = shelves[i].entities || []
+        if (!shelves[i] || typeof shelves[i] !== "object") continue
+        if (shelves[i].id === "continue-listening") inProgress = Array.isArray(shelves[i].entities) ? shelves[i].entities.slice(0, 100) : []
+        else if (shelves[i].id === "recently-added") recent = Array.isArray(shelves[i].entities) ? shelves[i].entities.slice(0, 100) : []
       }
       continueBooks = inProgress
       recentBooks = recent
@@ -654,8 +786,10 @@ Item {
       var sameAccount = server === requestServer && user && String(user.id || "") === requestUserId
       if (ok && sameAccount) {
         var next = ({})
-        var records = data.mediaProgress || []
-        for (var i = 0; i < records.length; i++) next[records[i].libraryItemId] = records[i]
+        var records = data && Array.isArray(data.mediaProgress) ? data.mediaProgress.slice(0, 20000) : []
+        for (var i = 0; i < records.length; i++) {
+          if (records[i] && records[i].libraryItemId) next[records[i].libraryItemId] = records[i]
+        }
         next = reconcileDownloadedProgress(next, requestServer, requestUserId)
         next = reconcileDirtyStreamProgress(next, requestServer, requestUserId)
         mediaProgress = next
@@ -764,11 +898,11 @@ Item {
       if (generation !== searchGeneration || libraryId !== selectedLibraryId) return
       searching = false
       if (!ok) { error = data; return }
-      var results = data.book || []
+      var results = data && Array.isArray(data.book) ? data.book.slice(0, 50) : []
       var items = []
       var seen = ({})
       for (var i = 0; i < results.length; i++) {
-        if (results[i].libraryItem && !seen[results[i].libraryItem.id]) {
+        if (results[i] && results[i].libraryItem && !seen[results[i].libraryItem.id]) {
           seen[results[i].libraryItem.id] = true
           items.push(results[i].libraryItem)
         }
@@ -827,9 +961,25 @@ Item {
       streamStartPending = false
       loading = false
       if (!ok) { sessionId = ""; error = data; return }
+      if (!data || typeof data !== "object") { sessionId = ""; error = "The server returned an invalid playback response"; return }
+      var tracks = Array.isArray(data.audioTracks) ? data.audioTracks : (Array.isArray(data.mediaTracks) ? data.mediaTracks : [])
+      var chapters = Array.isArray(data.chapters) ? data.chapters : []
+      if (tracks.length > 10000 || chapters.length > 10000) {
+        error = "The server returned too many tracks or chapters"
+        return
+      }
+      var validTracks = []
+      for (var trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+        if (tracks[trackIndex] && typeof tracks[trackIndex] === "object"
+            && typeof tracks[trackIndex].contentUrl === "string") validTracks.push(tracks[trackIndex])
+      }
+      var validChapters = []
+      for (var chapterIndex = 0; chapterIndex < chapters.length; chapterIndex++) {
+        if (chapters[chapterIndex] && typeof chapters[chapterIndex] === "object") validChapters.push(chapters[chapterIndex])
+      }
       currentItem = data.libraryItem || item
-      currentTracks = data.audioTracks || data.mediaTracks || []
-      currentChapters = data.chapters || []
+      currentTracks = validTracks
+      currentChapters = validChapters
       sessionId = data.id || ""
       sessionDuration = Number(data.duration || item.media.duration || 0)
       playbackStartedAt = Number(data.startedAt || Date.now())
@@ -872,7 +1022,14 @@ Item {
     var source = localPlayback && track.localPath ? "file://" + track.localPath : trustedMediaUrl(track.contentUrl)
     if (!localPlayback) {
       if (source === "") { error = "The server returned an untrusted audio URL"; return }
-      source += (source.indexOf("?") === -1 ? "?" : "&") + "token=" + encodeURIComponent(token)
+      if (!mediaProxyReady) {
+        pendingProxyTrackIndex = index
+        pendingProxySeekSeconds = seekSeconds
+        pendingProxyShouldPlay = shouldPlay === undefined || shouldPlay
+        startMediaProxy()
+        return
+      }
+      source = mediaProxyUrl(source)
     }
     player.source = source
     pendingSeekPosition = seekSeconds > 0 ? Math.max(0, seekSeconds - Number(track.startOffset || 0)) * 1000 : -1
@@ -1018,6 +1175,14 @@ Item {
     downloadToken = token
     downloadUserId = user ? user.id : ""
     downloadProgressRecord = progressForItem(itemId) ? Object.assign({}, progressForItem(itemId)) : null
+    var partials = Object.assign({}, offlineBooks)
+    partials[offlineKey(downloadItem.id, downloadServer, downloadUserId)] = {
+      server: downloadServer, userId: downloadUserId, item: downloadItem,
+      tracks: downloadTracks, chapters: downloadChapters,
+      progress: downloadProgressRecord, partial: true
+    }
+    offlineBooks = partials
+    offlineIndex.setText(JSON.stringify(offlineBooks, null, 2) + "\n")
     downloadStatus = "Downloading " + title
     downloadBytes = 0
     downloadCompletedBytes = 0
@@ -1071,15 +1236,113 @@ Item {
     }
     var destination = downloadDirectory(itemId, downloadServer, downloadUserId) + "/" + downloadTrackIndex + ".audio"
     downloadPath = destination
-    downloadProcess.payload = downloadToken + "\n"
-    downloadProcess.command = ["sh", "-c", "set -eu; umask 077; IFS= read -r token; mkdir -p \"$(dirname \"$1\")\"; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; chmod 600 \"$tmp\"; printf 'Authorization: Bearer %s\\n' \"$token\" > \"$tmp\"; curl --fail --silent --show-error --continue-at - --output \"$1\" --header @\"$tmp\" --url \"$2\"", "spokenshelf-download", destination, url]
+    downloadProcessError = ""
+    downloadCurrentBytes = 0
+    downloadProcess.payload = JSON.stringify({
+      server: downloadServer, token: downloadToken, url: url,
+      downloadsRoot: stateDirectory + "/downloads",
+      bookRoot: downloadDirectory(itemId, downloadServer, downloadUserId), destination: destination,
+      trackLimit: 8 * 1024 * 1024 * 1024, bookLimit: 64 * 1024 * 1024 * 1024
+    }) + "\n"
+    downloadProcess.command = ["python", transportPath, "download"]
     downloadProcess.running = true
+  }
+
+  function handleDownloadEvent(line) {
+    var event = null
+    try { event = JSON.parse(String(line || "")) } catch (_) { return }
+    if (event.event === "progress" || event.event === "complete") {
+      downloadCurrentBytes = Number(event.bytes || 0)
+      downloadBytes = downloadCompletedBytes + downloadCurrentBytes
+    } else if (event.event === "error") {
+      downloadProcessError = String(event.message || "Download failed")
+    }
+  }
+
+  function offlineKeyForBook(book) {
+    var itemServer = String(book._spokenShelfServer || server)
+    var itemUserId = String(book._spokenShelfUserId || (user ? user.id : ""))
+    for (var key in offlineBooks) {
+      var entry = offlineBooks[key]
+      if (entry && entry.item && entry.item.id === book.id
+          && String(entry.server || "") === itemServer && String(entry.userId || "") === itemUserId) return key
+    }
+    return ""
+  }
+
+  function deleteOfflineBook(book) {
+    if (!book || pendingDeletion || deleteProcess.running) return
+    var itemServer = String(book._spokenShelfServer || server)
+    var itemUserId = String(book._spokenShelfUserId || (user ? user.id : ""))
+    var itemId = safeItemId(book.id)
+    if (itemId === "") { error = "Cannot delete a download with an unsafe item ID"; return }
+    pendingDeletion = {
+      key: offlineKeyForBook(book), itemId: itemId, server: itemServer, userId: itemUserId,
+      bookRoot: downloadDirectory(itemId, itemServer, itemUserId)
+    }
+    if (pendingOfflineItemId === book.id && pendingOfflineServer === itemServer && pendingOfflineUserId === itemUserId) {
+      playbackGeneration += 1
+      playbackStartPending = false
+      streamStartPending = false
+      pendingOfflineItemId = ""
+      pendingOfflineServer = ""
+      pendingOfflineUserId = ""
+    }
+    if (currentItem && currentItem.id === book.id && localPlayback
+        && localSessionServer === itemServer && localSessionUserId === itemUserId) {
+      syncProgress(true)
+      player.stop()
+      player.source = ""
+      playbackGeneration += 1
+      playbackStartPending = false
+      streamStartPending = false
+      currentItem = null
+      currentTracks = []
+      currentChapters = []
+      sessionId = ""
+      localPlayback = false
+    }
+    if (downloadItem && downloadItem.id === book.id && downloadServer === itemServer && downloadUserId === itemUserId) {
+      if (downloadProcess.running) {
+        downloadProcess.running = false
+        return
+      }
+      resetDownloadState()
+      beginPendingDeletion()
+      return
+    }
+    beginPendingDeletion()
+  }
+
+  function resetDownloadState() {
+    downloadTrackIndex = -1
+    downloadItem = null
+    downloadProgressRecord = null
+    downloadTracks = []
+    downloadChapters = []
+    downloadServer = ""
+    downloadToken = ""
+    downloadUserId = ""
+    downloadPath = ""
+    downloadCurrentBytes = 0
+  }
+
+  function beginPendingDeletion() {
+    if (!pendingDeletion || deleteProcess.running) return
+    deleteProcessError = ""
+    deleteProcess.payload = JSON.stringify({
+      downloadsRoot: stateDirectory + "/downloads",
+      bookRoot: pendingDeletion.bookRoot,
+      protectedPaths: []
+    }) + "\n"
+    deleteProcess.command = ["python", transportPath, "delete"]
+    deleteProcess.running = true
   }
 
   function playOffline(itemId, itemServer, itemUserId) {
     if (streamStartPending) return
     var saved = offlineEntry(itemId, itemServer, itemUserId)
-    if (!saved) return
+    if (!saved || saved.partial) return
     streamStartPending = true
     pausedAt = 0
     if (currentItem) syncProgress(true)
@@ -1090,8 +1353,14 @@ Item {
     playbackStartPending = true
     var savedServer = saved.server || itemServer || server
     var savedUserId = saved.userId || ""
+    pendingOfflineItemId = itemId
+    pendingOfflineServer = savedServer
+    pendingOfflineUserId = savedUserId
     refreshProgress(savedServer, savedUserId, function(ok) {
       if (generation !== playbackGeneration) return
+      pendingOfflineItemId = ""
+      pendingOfflineServer = ""
+      pendingOfflineUserId = ""
       playbackStartPending = false
       streamStartPending = false
       startOfflinePlayback(saved, savedServer, savedUserId)
@@ -1198,18 +1467,35 @@ Item {
     var syncUserId = user ? String(user.id || "") : ""
     var restricted = sessionIds && sessionIds.length > 0
     var sent = []
+    var batchCharacters = 0
+    var oversizedIds = []
     for (var index = 0; index < queuedSessions.length; index++) {
       var queued = queuedSessions[index]
       if (restricted && sessionIds.indexOf(queued.id) === -1) continue
       if (queued.serverUrl === syncServer && syncUserId !== "" && String(queued.userId || "") === syncUserId) {
-        sent.push(Object.assign({}, queued, {
+        var candidate = Object.assign({}, queued, {
           deviceInfo: { deviceId: "spokenshelf", clientName: "SpokenShelf", clientVersion: "1.0.0" }
-        }))
+        })
+        var candidateCharacters = JSON.stringify(candidate).length
+        if (candidateCharacters > 200000) {
+          candidate.mediaMetadata = null
+          candidate.displayTitle = String(candidate.displayTitle || "").slice(0, 4096)
+          candidate.displayAuthor = String(candidate.displayAuthor || "").slice(0, 4096)
+          candidateCharacters = JSON.stringify(candidate).length
+        }
+        if (candidateCharacters > 200000) {
+          error = "A queued listening session is too large to upload safely"
+          oversizedIds.push(candidate.id)
+          continue
+        }
+        if (sent.length >= 25 || batchCharacters + candidateCharacters > 200000) break
+        sent.push(candidate)
+        batchCharacters += candidateCharacters
       }
     }
     if (sent.length === 0) {
       syncingOfflineSessions = false
-      finishOfflineSessionSync(true)
+      finishOfflineSessionSync(oversizedIds.length === 0)
       return
     }
     request("POST", "/api/session/local-all", {
@@ -1218,10 +1504,13 @@ Item {
     }, function(ok, data) {
       syncingOfflineSessions = false
       if (!ok) { finishOfflineSessionSync(false); return }
-      var results = data.sessions || data.results || []
+      var results = data && Array.isArray(data.sessions) ? data.sessions
+        : (data && Array.isArray(data.results) ? data.results : [])
+      results = results.slice(0, 25)
       var remaining = []
       var allSynced = true
       var newerSnapshotPending = false
+      var anotherBatchPending = false
       var retryIds = []
       var activeSessionSynced = false
       var activeSentSession = null
@@ -1232,13 +1521,19 @@ Item {
         if (current.serverUrl !== syncServer || String(current.userId || "") !== syncUserId) { remaining.push(current); continue }
         if (restricted && sessionIds.indexOf(current.id) === -1) { remaining.push(current); continue }
         for (var j = 0; j < sent.length; j++) if (sent[j].id === current.id) { sentSession = sent[j]; break }
-        for (var k = 0; k < results.length; k++) if (results[k].id === current.id) { result = results[k]; break }
+        for (var k = 0; k < results.length; k++) {
+          if (results[k] && results[k].id === current.id) { result = results[k]; break }
+        }
         if (sentSession && result && result.success && current.updatedAt > sentSession.updatedAt) {
           remaining.push(current)
           allSynced = false
           newerSnapshotPending = true
           retryIds.push(current.id)
-        } else if (!sentSession || !result || !result.success) {
+        } else if (!sentSession) {
+          remaining.push(current)
+          if (oversizedIds.indexOf(current.id) !== -1) allSynced = false
+          else anotherBatchPending = true
+        } else if (!result || !result.success) {
           remaining.push(current)
           allSynced = false
         } else if (current.id === localSessionId) {
@@ -1255,8 +1550,8 @@ Item {
         localSessionStartedAt = Date.now() - listeningAfterSnapshot * 1000
         localTimeListening = listeningAfterSnapshot
       }
-      if (newerSnapshotPending) {
-        syncOfflineSessions(null, retryIds)
+      if (newerSnapshotPending || anotherBatchPending) {
+        syncOfflineSessions(null, restricted ? sessionIds : null)
         return
       }
       finishOfflineSessionSync(allSynced)
@@ -1316,11 +1611,58 @@ Item {
   }
 
   Process {
+    id: mediaProxyProcess
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+    }
+    stdout: SplitParser { onRead: function(line) { root.handleMediaProxyReady(line) } }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(code) {
+      mediaProxyStable.stop()
+      var intentionallyStopped = root.stoppingMediaProxy
+      root.stoppingMediaProxy = false
+      root.mediaProxyReady = false
+      root.mediaProxyPort = 0
+      root.mediaProxyCapability = ""
+      if (intentionallyStopped || root.loggingOut || !root.connected) return
+      if (root.currentItem && !root.localPlayback && root.pendingProxyTrackIndex < 0) {
+        root.pendingProxyTrackIndex = root.currentTrackIndex
+        root.pendingProxySeekSeconds = root.pendingSeekPosition >= 0
+          ? Number(root.currentTracks[root.currentTrackIndex].startOffset || 0) + root.pendingSeekPosition / 1000
+          : root.position
+        root.pendingProxyShouldPlay = root.isPlaying
+        player.pause()
+        player.source = ""
+      }
+      root.mediaProxyFailureCount += 1
+      if (root.mediaProxyFailureCount <= 3) mediaProxyRestart.restart()
+      else root.error = "The private audio relay stopped repeatedly; reconnect to restart it"
+    }
+  }
+
+  Timer {
+    id: mediaProxyRestart
+    interval: Math.min(5000, 500 * Math.pow(2, Math.max(0, root.mediaProxyFailureCount - 1)))
+    repeat: false
+    onTriggered: root.startMediaProxy()
+  }
+
+  Timer {
+    id: mediaProxyStable
+    interval: 30000
+    repeat: false
+    onTriggered: root.mediaProxyFailureCount = 0
+  }
+
+  Process {
     id: loginProcess
     property string payload: ""
     stdinEnabled: true
     onStarted: {
-      write(payload + "\n")
+      write(payload)
       payload = ""
     }
     stdout: StdioCollector {
@@ -1490,18 +1832,20 @@ Item {
       write(payload)
       payload = ""
     }
+    stdout: SplitParser { onRead: function(line) { root.handleDownloadEvent(line) } }
     stderr: StdioCollector { id: downloadError; waitForEnd: true }
     onExited: function(code) {
+      if (root.pendingDeletion && root.downloadItem
+          && root.pendingDeletion.itemId === root.downloadItem.id
+          && root.pendingDeletion.server === root.downloadServer
+          && root.pendingDeletion.userId === root.downloadUserId) {
+        root.resetDownloadState()
+        root.beginPendingDeletion()
+        return
+      }
       if (code !== 0) {
-        root.downloadStatus = "Download failed: " + String(downloadError.text || "unknown error").trim()
-        root.downloadTrackIndex = -1
-        root.downloadItem = null
-        root.downloadProgressRecord = null
-        root.downloadTracks = []
-        root.downloadChapters = []
-        root.downloadServer = ""
-        root.downloadToken = ""
-        root.downloadUserId = ""
+        root.downloadStatus = "Download failed: " + (root.downloadProcessError || String(downloadError.text || "unknown error").trim())
+        root.resetDownloadState()
         return
       }
       var tracks = root.downloadTracks.slice()
@@ -1509,7 +1853,7 @@ Item {
       track.localPath = root.downloadDirectory(root.downloadItem.id, root.downloadServer, root.downloadUserId) + "/" + root.downloadTrackIndex + ".audio"
       tracks[root.downloadTrackIndex] = track
       root.downloadTracks = tracks
-      root.downloadCompletedBytes += Number(track.metadata && track.metadata.size ? track.metadata.size : track.bitRate * track.duration / 8 || 0)
+      root.downloadCompletedBytes += root.downloadCurrentBytes
       root.downloadBytes = root.downloadCompletedBytes
       root.downloadTrackIndex += 1
       root.downloadStatus = "Downloaded track " + root.downloadTrackIndex + " of " + root.downloadTracks.length
@@ -1517,33 +1861,43 @@ Item {
     }
   }
 
-  Timer {
-    interval: 500
-    running: root.downloading
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: {
-      if (!downloadSizeProcess.running && root.downloadPath !== "") {
-        downloadSizeProcess.command = ["stat", "--format=%s", root.downloadPath]
-        downloadSizeProcess.running = true
+  Process {
+    id: deleteProcess
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+    }
+    stdout: SplitParser {
+      onRead: function(line) {
+        try {
+          var event = JSON.parse(String(line || ""))
+          if (event.event === "error") root.deleteProcessError = String(event.message || "Deletion failed")
+        } catch (_) {}
       }
     }
-  }
-
-  Process {
-    id: downloadSizeProcess
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var size = Number(text.trim())
-        if (!isNaN(size)) root.downloadBytes = root.downloadCompletedBytes + size
+    stderr: StdioCollector { id: deleteError; waitForEnd: true }
+    onExited: function(code) {
+      var deletion = root.pendingDeletion
+      if (!deletion) return
+      if (code === 0) {
+        var next = Object.assign({}, root.offlineBooks)
+        if (deletion.key !== "") delete next[deletion.key]
+        root.offlineBooks = next
+        offlineIndex.setText(JSON.stringify(root.offlineBooks, null, 2) + "\n")
+        root.downloadStatus = "Deleted local download"
+      } else {
+        root.error = "Could not delete download: " + (root.deleteProcessError || String(deleteError.text || "unknown error").trim())
       }
+      root.pendingDeletion = null
     }
   }
 
   FileView {
     id: offlineIndex
-    path: root.stateDirectory + "/downloads.json"
+    preload: false
+    path: root.stateReady ? root.stateDirectory + "/downloads.json" : ""
     printErrors: false
     onLoaded: {
       try { root.offlineBooks = root.migrateOfflineBooks(JSON.parse(text())) } catch (_) { root.offlineBooks = ({}) }
@@ -1553,7 +1907,8 @@ Item {
 
   FileView {
     id: offlineSessionsFile
-    path: root.stateDirectory + "/offline-sessions.json"
+    preload: false
+    path: root.stateReady ? root.stateDirectory + "/offline-sessions.json" : ""
     printErrors: false
     onLoaded: {
       try { root.queuedSessions = JSON.parse(text()) } catch (_) { root.queuedSessions = [] }
@@ -1563,7 +1918,8 @@ Item {
 
   FileView {
     id: serverFile
-    path: root.stateDirectory + "/server-url"
+    preload: false
+    path: root.stateReady ? root.stateDirectory + "/server-url" : ""
     printErrors: false
     onLoaded: {
       var savedServer = Api.normalizeServer(text())
@@ -1572,17 +1928,34 @@ Item {
   }
 
   Component.onCompleted: {
+    stateDirectoryInit.payload = JSON.stringify({ stateRoot: stateDirectory }) + "\n"
+    stateDirectoryInit.command = ["python", transportPath, "init"]
     stateDirectoryInit.running = true
     zenityCheck.running = true
+    pythonCheck.running = true
     mprisCheck.running = true
     refreshAudioOutputs()
-    serverFile.reload()
   }
-  Component.onDestruction: syncProgress(true)
+  Component.onDestruction: {
+    syncProgress(true)
+    stopMediaProxy()
+  }
 
   Process {
     id: stateDirectoryInit
-    command: ["sh", "-c", "umask 077; mkdir -p \"$1/downloads\"; chmod 700 \"$1\" \"$1/downloads\"; touch \"$1/downloads.json\" \"$1/offline-sessions.json\" \"$1/server-url\"; chmod 600 \"$1/downloads.json\" \"$1/offline-sessions.json\" \"$1/server-url\"", "spokenshelf-state", root.stateDirectory]
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: {
+      write(payload)
+      payload = ""
+    }
+    onExited: function(code) {
+      if (code !== 0) { root.error = "Could not initialize SpokenShelf's private state directory"; return }
+      root.stateReady = true
+      offlineIndex.reload()
+      offlineSessionsFile.reload()
+      serverFile.reload()
+    }
   }
 
   Process {
@@ -1591,10 +1964,18 @@ Item {
     onExited: function(code) {
       root.zenityChecked = true
       root.zenityAvailable = code === 0
-      root.dependencyError = root.zenityAvailable
-        ? ""
-        : "Cannot open the connection form: install zenity with `omarchy pkg add zenity`."
+      root.updateDependencyError()
       if (root.credentialPromptPending) root.promptForCredentials()
+    }
+  }
+
+  Process {
+    id: pythonCheck
+    command: ["sh", "-c", "command -v python >/dev/null 2>&1"]
+    onExited: function(code) {
+      root.pythonChecked = true
+      root.pythonAvailable = code === 0
+      root.updateDependencyError()
     }
   }
 

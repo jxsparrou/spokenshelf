@@ -13,6 +13,7 @@ CursorSurface {
   readonly property var progress: book ? service.progressForItem(book.id) : null
   readonly property real progressValue: progress ? Math.max(0, Math.min(1, Number(progress.progress || 0))) : 0
   signal activated()
+  signal deleteRequested()
 
   implicitHeight: Style.space(76)
   foreground: bar.foreground
@@ -111,7 +112,7 @@ CursorSurface {
 
   Text {
     id: statusIcon
-    anchors.right: parent.right
+    anchors.right: deleteButton.visible ? deleteButton.left : parent.right
     anchors.rightMargin: Style.space(8)
     anchors.verticalCenter: parent.verticalCenter
     text: root.offline || root.service.isDownloaded(root.book.id) ? "󰇚" : "󰐊"
@@ -126,5 +127,30 @@ CursorSurface {
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     onClicked: root.activated()
+  }
+
+  Text {
+    id: deleteButton
+    visible: root.offline
+    anchors.right: parent.right
+    anchors.rightMargin: Style.space(8)
+    anchors.verticalCenter: parent.verticalCenter
+    z: 2
+    text: "󰆴"
+    color: deletePointer.containsMouse ? "tomato" : root.bar.foreground
+    font.family: root.bar.fontFamily
+    font.pixelSize: Style.font.icon
+
+    MouseArea {
+      id: deletePointer
+      anchors.fill: parent
+      anchors.margins: -Style.space(8)
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: function(mouse) {
+        mouse.accepted = true
+        root.deleteRequested()
+      }
+    }
   }
 }

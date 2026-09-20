@@ -10,13 +10,23 @@ BarWidget {
   readonly property var service: bar && bar.shell ? bar.shell.serviceFor(moduleName) : null
   property bool popupOpen: false
   property string page: "home"
+  property var pendingDeleteBook: null
 
-  function close() { popupOpen = false }
+  function close() {
+    popupOpen = false
+    pendingDeleteBook = null
+    deleteConfirm.opened = false
+  }
   function playBook(book, offline) {
     if (!service || !book) return
+    if (book._spokenShelfPartial) return
     if (offline || service.isDownloaded(book.id)) service.playOffline(book.id, book._spokenShelfServer || "", book._spokenShelfUserId || "")
     else service.playItem(book)
     page = "player"
+  }
+  function confirmDelete(book) {
+    pendingDeleteBook = book
+    deleteConfirm.opened = true
   }
 
   implicitWidth: button.implicitWidth
@@ -33,7 +43,11 @@ BarWidget {
     onPressed: function(mouseButton) {
       if (!root.service) return
       var opening = !root.popupOpen
-      root.popupOpen = opening
+      if (!opening) {
+        root.close()
+        return
+      }
+      root.popupOpen = true
       if (opening && root.service.connected) root.service.refreshVisibleProgress()
       if (opening && !root.service.connected) {
         var hasDownloads = Object.keys(root.service.offlineBooks).length > 0
@@ -51,7 +65,7 @@ BarWidget {
       else searchField.text = ""
     }
     function onSelectedAudioOutputIdChanged() { audioOutputDropdown.value = root.service.selectedAudioOutputId }
-    function onCredentialPromptStarting() { root.popupOpen = false }
+    function onCredentialPromptStarting() { root.close() }
     function onCredentialPromptUnavailable() { root.popupOpen = true }
   }
 
@@ -330,6 +344,7 @@ BarWidget {
               bar: root.bar
               offline: true
               onActivated: root.playBook(modelData, true)
+              onDeleteRequested: root.confirmDelete(modelData)
             }
           }
         }
@@ -678,6 +693,25 @@ BarWidget {
             }
           }
         }
+      }
+    }
+
+    ConfirmDialog {
+      id: deleteConfirm
+      anchors.fill: parent
+      message: root.pendingDeleteBook && root.pendingDeleteBook._spokenShelfPartial
+        ? "Cancel this download and remove its partial files?"
+        : "Delete this downloaded book from this device? Listening progress will be kept."
+      confirmText: root.pendingDeleteBook && root.pendingDeleteBook._spokenShelfPartial ? "Cancel download" : "Delete download"
+      onCanceled: {
+        root.pendingDeleteBook = null
+        opened = false
+      }
+      onConfirmed: {
+        var book = root.pendingDeleteBook
+        root.pendingDeleteBook = null
+        opened = false
+        if (root.service && book) root.service.deleteOfflineBook(book)
       }
     }
   }

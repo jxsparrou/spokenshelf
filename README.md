@@ -7,7 +7,8 @@ SpokenShelf is a native Omarchy shell player for [Audiobookshelf](https://www.au
 - Continue Listening and Recently Added home shelves.
 - Searchable library with cover artwork and per-book progress.
 - Server streaming with automatic resume.
-- Resumable downloads and offline playback.
+- Resumable, quota-limited downloads and offline playback.
+- On-device deletion for completed and partial downloads.
 - Offline progress reconciliation after reconnecting.
 - Book and chapter seek controls with elapsed and remaining time.
 - Selectable audio output with automatic system-default tracking.
@@ -19,14 +20,14 @@ SpokenShelf is a native Omarchy shell player for [Audiobookshelf](https://www.au
 
 - Omarchy with the plugin-capable shell.
 - An Audiobookshelf server. SpokenShelf is tested against Audiobookshelf 2.36.1.
-- `curl`, `zenity`, and `secret-tool` (from `libsecret`).
-- Optional: Python 3 and the Python `dbus-next` package for MPRIS media-key and desktop media controls.
+- Python 3, `zenity`, and `secret-tool` (from `libsecret`).
+- Optional: the Python `dbus-next` package for MPRIS media-key and desktop media controls.
 - Qt Multimedia support for the audio formats stored by your server.
 
 Install missing command-line dependencies with:
 
 ```sh
-omarchy pkg add curl zenity libsecret python python-dbus-next
+omarchy pkg add python zenity libsecret python-dbus-next
 ```
 
 SpokenShelf does not install packages, request elevated privileges, or modify system configuration.
@@ -78,7 +79,7 @@ Username and password credentials are sent only to the configured server's `/log
 
 - **Home** shows books in progress and recently added books.
 - **Library** lists all books and supports title, author, and series search.
-- **Offline** lists downloaded books.
+- **Offline** lists downloaded books and active partial downloads. Use the trash action there to delete a download or cancel and remove a partial download.
 - Selecting a downloaded book from any page prefers its local audio file.
 - Progress refreshes from the server when the panel opens and before playback resumes. Downloaded books upload queued offline listening before applying server progress when connected.
 - Resuming after at least 10 seconds paused rewinds playback by 5 seconds for context.
@@ -86,7 +87,7 @@ Username and password credentials are sent only to the configured server's `/log
 - Hardware play/pause keys work through MPRIS while SpokenShelf has a loaded book.
 - Use **Log out** in the panel header to forget the current server credentials and connect to another server. Downloads are kept.
 
-Downloads and queued offline sessions are stored under `~/.local/state/omarchy-audiobookshelf/`. The state directory is restricted to the current user. Downloads can be large and are not removed automatically.
+Downloads and queued offline sessions are stored under `~/.local/state/omarchy-audiobookshelf/`. The state directory is restricted to the current user. Each track is limited to 8 GiB and each book to 64 GiB. Downloads are not removed automatically.
 
 ## Remove
 
@@ -112,9 +113,11 @@ secret-tool clear service omarchy-audiobookshelf server https://your-server.exam
 
 - Tokens are stored in the desktop keyring, not in plugin files.
 - Passwords are not persisted.
-- Cover images, library metadata, audio, progress, and login requests communicate directly with the configured Audiobookshelf server.
+- Cover images communicate directly with the configured Audiobookshelf server. Authenticated API, login, download, and audio requests pass through the bundled Python transport.
 - Cover artwork uses Audiobookshelf's unauthenticated item-cover endpoint; audio and API requests are authenticated.
-- Qt Multimedia cannot attach custom HTTP headers, so authenticated streaming URLs contain the token in their query string. SpokenShelf rejects absolute audio URLs outside the configured server before attaching credentials.
+- Qt Multimedia receives only a random-capability URL on an ephemeral `127.0.0.1` relay. The relay adds the bearer header upstream, accepts only same-server URLs and redirects, and keeps tokens out of media URLs, process arguments, files, and logs.
+- Login responses are limited to 256 KiB, API responses to 8 MiB, and API request bodies to 1 MiB. Library pages and queued listening-session uploads are processed in bounded batches.
+- Downloads use resumable partial files, reject unsafe paths and symbolic links, and enforce 8 GiB per-track and 64 GiB per-book storage limits while streaming.
 - The local MPRIS bridge publishes the current title, author, cover URL, duration, position, playback state, and volume on the user's session D-Bus so desktop media controls can work.
 - Download metadata and queued progress include library details and listening history and are stored in user-only local state files.
 
@@ -123,7 +126,8 @@ secret-tool clear service omarchy-audiobookshelf server https://your-server.exam
 ```sh
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" Service.qml BarWidget.qml BookRow.qml
-python -m py_compile mpris.py
+python -m unittest discover -s tests -v
+python -m py_compile transport.py mpris.py
 ```
 
 Do not commit server URLs, API tokens, passwords, downloaded audio, state files, or keyring exports.
