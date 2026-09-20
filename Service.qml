@@ -55,9 +55,12 @@ Item {
   property var offlineSyncCallbacks: []
   property bool loadingProgress: false
   property var progressLoadCallbacks: []
+  property bool progressReloadPending: false
+  property var progressReloadCallbacks: []
   property int playbackGeneration: 0
   property bool playbackStartPending: false
   property bool streamStartPending: false
+  property double pausedAt: 0
   property var unsyncedStreamProgress: ({})
   property var dirtyStreamProgress: ({})
   property alias playbackVolume: audioOutput.volume
@@ -91,6 +94,8 @@ Item {
   signal credentialPromptUnavailable()
 
   readonly property bool isPlaying: player.playbackState === MediaPlayer.PlayingState
+  readonly property int resumeRewindSeconds: 5
+  readonly property int resumeRewindPauseMs: 10000
   readonly property real trackStartOffset: currentTracks.length > currentTrackIndex ? Number(currentTracks[currentTrackIndex].startOffset || 0) : 0
   readonly property real position: trackStartOffset + player.position / 1000
   readonly property real duration: sessionDuration > 0 ? sessionDuration : player.duration / 1000
@@ -532,11 +537,14 @@ Item {
     playbackGeneration += 1
     playbackStartPending = false
     streamStartPending = false
+    pausedAt = 0
     unsyncedStreamProgress = ({})
     dirtyStreamProgress = ({})
     offlineSyncCallbacks = []
     loadingProgress = false
     progressLoadCallbacks = []
+    progressReloadPending = false
+    progressReloadCallbacks = []
     mediaProgress = ({})
     selectedLibraryId = ""
     currentItem = null
@@ -630,7 +638,12 @@ Item {
     })
   }
 
-  function loadProgress(callback) {
+  function loadProgress(callback, forceReload) {
+    if (loadingProgress && forceReload) {
+      progressReloadPending = true
+      if (callback) progressReloadCallbacks = progressReloadCallbacks.concat([callback])
+      return
+    }
     if (callback) progressLoadCallbacks = progressLoadCallbacks.concat([callback])
     if (loadingProgress) return
     loadingProgress = true
@@ -650,6 +663,14 @@ Item {
       var callbacks = progressLoadCallbacks.slice()
       progressLoadCallbacks = []
       for (var j = 0; j < callbacks.length; j++) callbacks[j](ok && sameAccount)
+      if (progressReloadPending) {
+        var reloadCallbacks = progressReloadCallbacks.slice()
+        progressReloadPending = false
+        progressReloadCallbacks = []
+        loadProgress(function(reloadOk) {
+          for (var k = 0; k < reloadCallbacks.length; k++) reloadCallbacks[k](reloadOk)
+        }, false)
+      }
     })
   }
 
@@ -712,7 +733,7 @@ Item {
         if (callback) callback(false)
         return
       }
-      loadProgress(callback)
+      loadProgress(callback, true)
     })
   }
 
@@ -791,6 +812,7 @@ Item {
     if (streamStartPending) return
     playbackGeneration += 1
     playbackStartPending = false
+    pausedAt = 0
     streamStartPending = true
     if (currentItem) syncProgress(true)
     player.pause()
@@ -843,7 +865,7 @@ Item {
     startTrack(0, 0)
   }
 
-  function startTrack(index, seekSeconds) {
+  function startTrack(index, seekSeconds, shouldPlay) {
     if (index < 0 || index >= currentTracks.length) return
     currentTrackIndex = index
     var track = currentTracks[index]
@@ -854,13 +876,14 @@ Item {
     }
     player.source = source
     pendingSeekPosition = seekSeconds > 0 ? Math.max(0, seekSeconds - Number(track.startOffset || 0)) * 1000 : -1
-    player.play()
+    if (shouldPlay === undefined || shouldPlay) player.play()
   }
 
   function togglePlayback() {
     if (streamStartPending) return
     if (isPlaying) {
       player.pause()
+      pausedAt = Date.now()
       syncProgress(false)
     } else if (playbackStartPending) {
       playbackGeneration += 1
@@ -872,24 +895,30 @@ Item {
       playbackGeneration += 1
       var generation = playbackGeneration
       playbackStartPending = true
+      var rewindOnResume = pausedAt > 0 && Date.now() - pausedAt >= resumeRewindPauseMs
       var itemServer = localPlayback ? localSessionServer : server
       var itemUserId = localPlayback ? localSessionUserId : (user ? user.id : "")
       refreshProgress(itemServer, itemUserId, function(ok) {
         if (generation !== playbackGeneration || currentItem !== item || isPlaying) return
         playbackStartPending = false
-        if (ok) seekToSavedProgress(item.id)
+        var target = resumePosition(item.id, ok)
+        if (rewindOnResume) target = Math.max(0, target - resumeRewindSeconds)
+        pausedAt = 0
+        if ((rewindOnResume && Math.abs(target - position) > 0.001) || Math.abs(target - position) > 1) seek(target, true)
         player.play()
       })
     }
   }
 
-  function seekToSavedProgress(itemId) {
+  function resumePosition(itemId, useSavedProgress) {
+    if (!useSavedProgress) return position
     var saved = progressForItem(itemId)
-    if (!saved) return
+    if (!saved) return position
     var target = saved.isFinished ? 0 : Number(saved.currentTime || 0)
-    if (isFinite(target) && Math.abs(target - position) > 1) seek(target, true)
+    return isFinite(target) ? Math.max(0, Math.min(duration, target)) : position
   }
   function seek(seconds, preservePendingPlayback) {
+    if (!preservePendingPlayback && !isPlaying) pausedAt = 0
     if (playbackStartPending && !preservePendingPlayback) {
       playbackGeneration += 1
       playbackStartPending = false
@@ -902,7 +931,7 @@ Item {
       var end = start + Number(track.duration || 0)
       if (target >= start && (target < end || i === currentTracks.length - 1)) {
         if (i === currentTrackIndex) player.position = (target - start) * 1000
-        else startTrack(i, target)
+        else startTrack(i, target, isPlaying || preservePendingPlayback)
         return
       }
     }
@@ -1052,6 +1081,7 @@ Item {
     var saved = offlineEntry(itemId, itemServer, itemUserId)
     if (!saved) return
     streamStartPending = true
+    pausedAt = 0
     if (currentItem) syncProgress(true)
     player.pause()
     loading = false
@@ -1159,16 +1189,18 @@ Item {
     listenedSinceSync = 0
   }
 
-  function syncOfflineSessions(callback) {
+  function syncOfflineSessions(callback, sessionIds) {
     if (callback) offlineSyncCallbacks = offlineSyncCallbacks.concat([callback])
     if (syncingOfflineSessions) return
     if (queuedSessions.length === 0) { finishOfflineSessionSync(true); return }
     syncingOfflineSessions = true
     var syncServer = server
     var syncUserId = user ? String(user.id || "") : ""
+    var restricted = sessionIds && sessionIds.length > 0
     var sent = []
     for (var index = 0; index < queuedSessions.length; index++) {
       var queued = queuedSessions[index]
+      if (restricted && sessionIds.indexOf(queued.id) === -1) continue
       if (queued.serverUrl === syncServer && syncUserId !== "" && String(queued.userId || "") === syncUserId) {
         sent.push(Object.assign({}, queued, {
           deviceInfo: { deviceId: "spokenshelf", clientName: "SpokenShelf", clientVersion: "1.0.0" }
@@ -1189,6 +1221,8 @@ Item {
       var results = data.sessions || data.results || []
       var remaining = []
       var allSynced = true
+      var newerSnapshotPending = false
+      var retryIds = []
       var activeSessionSynced = false
       var activeSentSession = null
       for (var i = 0; i < queuedSessions.length; i++) {
@@ -1196,9 +1230,15 @@ Item {
         var sentSession = null
         var result = null
         if (current.serverUrl !== syncServer || String(current.userId || "") !== syncUserId) { remaining.push(current); continue }
+        if (restricted && sessionIds.indexOf(current.id) === -1) { remaining.push(current); continue }
         for (var j = 0; j < sent.length; j++) if (sent[j].id === current.id) { sentSession = sent[j]; break }
         for (var k = 0; k < results.length; k++) if (results[k].id === current.id) { result = results[k]; break }
-        if (!sentSession || !result || !result.success || current.updatedAt > sentSession.updatedAt) {
+        if (sentSession && result && result.success && current.updatedAt > sentSession.updatedAt) {
+          remaining.push(current)
+          allSynced = false
+          newerSnapshotPending = true
+          retryIds.push(current.id)
+        } else if (!sentSession || !result || !result.success) {
           remaining.push(current)
           allSynced = false
         } else if (current.id === localSessionId) {
@@ -1214,6 +1254,10 @@ Item {
         localSessionStartTime = Number(activeSentSession.currentTime || position)
         localSessionStartedAt = Date.now() - listeningAfterSnapshot * 1000
         localTimeListening = listeningAfterSnapshot
+      }
+      if (newerSnapshotPending) {
+        syncOfflineSessions(null, retryIds)
+        return
       }
       finishOfflineSessionSync(allSynced)
     })
