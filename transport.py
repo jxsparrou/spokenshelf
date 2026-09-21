@@ -424,7 +424,8 @@ def safe_regular_files(directory_fd: int) -> list[tuple[str, int]]:
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if not stat.S_ISREG(info.st_mode):
             raise TransportError("Unsafe file in download directory")
-        if not (name.endswith(".audio") or name.endswith(".audio.part") or name.endswith(".part.json")):
+        if not (name.endswith(".audio") or name.endswith(".audio.part")
+                or name.endswith(".audio.json") or name.endswith(".part.json")):
             raise TransportError("Unexpected file in download directory")
         files.append((name, info.st_size))
     return files
@@ -487,35 +488,64 @@ def download_mode() -> int:
         os.close(downloads_fd)
 
 
+def read_download_metadata(book_fd: int, name: str) -> dict:
+    try:
+        metadata_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=book_fd)
+    except FileNotFoundError:
+        return {}
+    try:
+        raw = os.read(metadata_fd, 4097)
+        if len(raw) > 4096:
+            return {}
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    finally:
+        os.close(metadata_fd)
+
+
 def download_locked(server, token, target, book_fd, destination, track_limit, book_limit) -> int:
+    source = validate_target(server, target)
     files = safe_regular_files(book_fd)
     file_sizes = dict(files)
     book_bytes = sum(size for name, size in files if not name.endswith(".json"))
+    part = destination + ".part"
+    metadata_path = part + ".json"
+    completed_metadata_path = destination + ".json"
     if destination in file_sizes:
         size = file_sizes[destination]
         if size > track_limit or book_bytes > book_limit:
             raise TransportError("Existing download exceeds the configured quota")
-        emit_event({"event": "complete", "bytes": size})
-        return 0
-    part = destination + ".part"
-    metadata_path = part + ".json"
+        completed_metadata = read_download_metadata(book_fd, completed_metadata_path)
+        if not completed_metadata and part not in file_sizes:
+            completed_metadata = read_download_metadata(book_fd, metadata_path)
+            if completed_metadata:
+                os.replace(metadata_path, completed_metadata_path, src_dir_fd=book_fd, dst_dir_fd=book_fd)
+        if completed_metadata.get("source") == source:
+            emit_event({"event": "complete", "bytes": size})
+            return 0
     existing = file_sizes.get(part, 0)
+    metadata = read_download_metadata(book_fd, metadata_path)
+    if existing and metadata.get("source") != source:
+        os.unlink(part, dir_fd=book_fd)
+        try:
+            os.unlink(metadata_path, dir_fd=book_fd)
+        except FileNotFoundError:
+            pass
+        book_bytes -= existing
+        existing = 0
+        metadata = {}
     other_book_bytes = book_bytes - existing
     if existing > track_limit or book_bytes > book_limit:
         raise TransportError("Existing download exceeds the configured quota")
-    validator = ""
-    if metadata_path in file_sizes:
-        try:
-            metadata_fd = os.open(metadata_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=book_fd)
-            with os.fdopen(metadata_fd, "r") as metadata_file:
-                validator = str(json.load(metadata_file).get("validator", ""))
-        except (OSError, json.JSONDecodeError, AttributeError, UnicodeDecodeError):
-            validator = ""
+    validator = str(metadata.get("validator", ""))
     headers = {}
-    if existing:
+    if existing and validator:
         headers["Range"] = f"bytes={existing}-"
-        if validator:
-            headers["If-Range"] = validator
+        headers["If-Range"] = validator
+    elif existing:
+        existing = 0
     connection, response, _ = open_upstream(server, target, token, "GET", headers, timeout=30)
     try:
         if existing and response.status == 416:
@@ -523,13 +553,11 @@ def download_locked(server, token, target, book_fd, destination, track_limit, bo
             match = re.fullmatch(r"bytes \*/(\d+)", content_range)
             if match and int(match.group(1)) == existing:
                 os.replace(part, destination, src_dir_fd=book_fd, dst_dir_fd=book_fd)
-                try:
-                    os.unlink(metadata_path, dir_fd=book_fd)
-                except FileNotFoundError:
-                    pass
+                os.replace(metadata_path, completed_metadata_path, src_dir_fd=book_fd, dst_dir_fd=book_fd)
                 emit_event({"event": "complete", "bytes": existing})
                 return 0
             raise TransportError("Server rejected the partial download")
+        response_validator = response.getheader("ETag") or response.getheader("Last-Modified") or ""
         if existing and response.status == 206:
             content_range = response.getheader("Content-Range", "")
             range_start, range_end, range_total = validate_content_range(
@@ -537,6 +565,8 @@ def download_locked(server, token, target, book_fd, destination, track_limit, bo
             )
             if range_start != existing:
                 raise TransportError("Server returned an invalid resume range")
+            if response_validator != validator:
+                raise TransportError("Server returned a different file while resuming")
         elif response.status == 200:
             existing = 0
         elif response.status == 206:
@@ -549,25 +579,25 @@ def download_locked(server, token, target, book_fd, destination, track_limit, bo
         else:
             raise TransportError(f"Server returned HTTP {response.status}")
 
-        response_validator = response.getheader("ETag") or response.getheader("Last-Modified") or ""
         content_length = response.getheader("Content-Length")
+        expected = None
         if content_length and content_length.isdigit():
             expected = existing + int(content_length)
             if expected > track_limit or other_book_bytes + expected > book_limit:
                 raise TransportError("Download exceeded the configured storage quota")
-        metadata_fd = os.open(
-            metadata_path,
-            os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=book_fd,
-        )
-        with os.fdopen(metadata_fd, "w") as metadata_file:
-            json.dump({"validator": response_validator}, metadata_file)
         output_flags = os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
         output_flags |= os.O_APPEND if existing else os.O_TRUNC
         written = existing
         output_fd = os.open(part, output_flags, 0o600, dir_fd=book_fd)
         with os.fdopen(output_fd, "ab" if existing else "wb") as output:
+            metadata_fd = os.open(
+                metadata_path,
+                os.O_CREAT | os.O_TRUNC | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=book_fd,
+            )
+            with os.fdopen(metadata_fd, "w") as metadata_file:
+                json.dump({"validator": response_validator, "source": source}, metadata_file)
             while True:
                 chunk = response.read(CHUNK_SIZE)
                 if not chunk:
@@ -584,13 +614,12 @@ def download_locked(server, token, target, book_fd, destination, track_limit, bo
                 emit_event({"event": "progress", "bytes": written})
             output.flush()
             os.fsync(output.fileno())
+        if expected is not None and written != expected:
+            raise TransportError("Server returned an incomplete download")
         if response.status == 206 and written != range_total:
             raise TransportError("Server returned an incomplete range")
         os.replace(part, destination, src_dir_fd=book_fd, dst_dir_fd=book_fd)
-        try:
-            os.unlink(metadata_path, dir_fd=book_fd)
-        except FileNotFoundError:
-            pass
+        os.replace(metadata_path, completed_metadata_path, src_dir_fd=book_fd, dst_dir_fd=book_fd)
         emit_event({"event": "complete", "bytes": written})
         return 0
     finally:

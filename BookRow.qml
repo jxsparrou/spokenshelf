@@ -115,10 +115,13 @@ CursorSurface {
     anchors.right: deleteButton.visible ? deleteButton.left : parent.right
     anchors.rightMargin: Style.space(8)
     anchors.verticalCenter: parent.verticalCenter
-    text: root.offline || root.service.isDownloaded(root.book.id) ? "󰇚" : "󰐊"
+    text: root.book && root.book._spokenShelfPartial
+      ? (root.service.downloading && root.service.isActiveDownload(root.book)
+          ? Math.round(root.service.downloadProgress * 100) + "%" : "Partial")
+      : (root.offline || root.service.isDownloaded(root.book.id) ? "󰇚" : "󰐊")
     color: root.bar.foreground
     font.family: root.bar.fontFamily
-    font.pixelSize: Style.font.icon
+    font.pixelSize: root.book && root.book._spokenShelfPartial ? Style.font.caption : Style.font.icon
   }
 
   MouseArea {

@@ -37,6 +37,7 @@ class FakeHandler(BaseHTTPRequestHandler):
             "path": self.path,
             "authorization": self.headers.get("Authorization", ""),
             "range": self.headers.get("Range", ""),
+            "if_range": self.headers.get("If-Range", ""),
         })
         if self.path == "/redirect":
             self.send_response(302)
@@ -61,6 +62,39 @@ class FakeHandler(BaseHTTPRequestHandler):
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{start + 9}/1000")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", '"test"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+        if self.path == "/ignore-range":
+            body = type(self).payload
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", '"replacement"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return
+        if self.path == "/truncated":
+            body = type(self).payload
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("ETag", '"truncated"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body[:10])
+                self.wfile.flush()
+                self.close_connection = True
+            return
+        if self.path in ("/changed-validator-range", "/missing-validator-range"):
+            start = int(self.headers.get("Range", "bytes=0-").removeprefix("bytes=").split("-", 1)[0])
+            body = type(self).payload[start:]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{len(type(self).payload) - 1}/{len(type(self).payload)}")
+            self.send_header("Content-Length", str(len(body)))
+            if self.path == "/changed-validator-range":
+                self.send_header("ETag", '"changed"')
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
@@ -343,6 +377,10 @@ class TransportTests(unittest.TestCase):
             destination = book_root / "0.audio"
             part = book_root / "0.audio.part"
             part.write_bytes(b"start")
+            (book_root / "0.audio.part.json").write_text(json.dumps({
+                "validator": '"test"',
+                "source": server.url + "/short-range",
+            }))
             result = run_mode("download", {
                 "server": server.url,
                 "url": server.url + "/short-range",
@@ -355,6 +393,140 @@ class TransportTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(destination.exists())
             self.assertEqual(part.stat().st_size, 15)
+
+    def test_completed_track_is_bound_to_source(self):
+        with Server() as server, tempfile.TemporaryDirectory() as temporary:
+            downloads_root = Path(temporary) / "downloads"
+            book_root = downloads_root / "scope" / "book"
+            destination = book_root / "0.audio"
+            config = {
+                "server": server.url,
+                "url": server.url + "/first",
+                "downloadsRoot": str(downloads_root),
+                "bookRoot": str(book_root),
+                "destination": str(destination),
+                "trackLimit": 2000,
+                "bookLimit": 2000,
+            }
+            first = run_mode("download", config)
+            self.assertEqual(first.returncode, 0)
+            metadata = json.loads((book_root / "0.audio.json").read_text())
+            self.assertEqual(metadata["source"], server.url + "/first")
+
+            config["url"] = server.url + "/replacement"
+            second = run_mode("download", config)
+            self.assertEqual(second.returncode, 0)
+            metadata = json.loads((book_root / "0.audio.json").read_text())
+            self.assertEqual(metadata["source"], server.url + "/replacement")
+            self.assertEqual(FakeHandler.requests[-1]["path"], "/replacement")
+
+    def test_failed_replacement_preserves_completed_track(self):
+        with Server() as server, tempfile.TemporaryDirectory() as temporary:
+            downloads_root = Path(temporary) / "downloads"
+            book_root = downloads_root / "scope" / "book"
+            destination = book_root / "0.audio"
+            config = {
+                "server": server.url,
+                "url": server.url + "/first",
+                "downloadsRoot": str(downloads_root),
+                "bookRoot": str(book_root),
+                "destination": str(destination),
+                "trackLimit": 2000,
+                "bookLimit": 4000,
+            }
+            first = run_mode("download", config)
+            self.assertEqual(first.returncode, 0)
+            original = destination.read_bytes()
+
+            config["url"] = server.url + "/huge"
+            replacement = run_mode("download", config)
+            self.assertNotEqual(replacement.returncode, 0)
+            self.assertEqual(destination.read_bytes(), original)
+            metadata = json.loads((book_root / "0.audio.json").read_text())
+            self.assertEqual(metadata["source"], server.url + "/first")
+
+    def test_truncated_replacement_preserves_completed_track(self):
+        with Server() as server, tempfile.TemporaryDirectory() as temporary:
+            downloads_root = Path(temporary) / "downloads"
+            book_root = downloads_root / "scope" / "book"
+            destination = book_root / "0.audio"
+            config = {
+                "server": server.url,
+                "url": server.url + "/first",
+                "downloadsRoot": str(downloads_root),
+                "bookRoot": str(book_root),
+                "destination": str(destination),
+                "trackLimit": 2000,
+                "bookLimit": 4000,
+            }
+            first = run_mode("download", config)
+            self.assertEqual(first.returncode, 0)
+            original = destination.read_bytes()
+
+            config["url"] = server.url + "/truncated"
+            replacement = run_mode("download", config)
+            self.assertNotEqual(replacement.returncode, 0)
+            self.assertEqual(destination.read_bytes(), original)
+            metadata = json.loads((book_root / "0.audio.json").read_text())
+            self.assertEqual(metadata["source"], server.url + "/first")
+
+    def test_resume_rejects_changed_or_missing_validator(self):
+        for endpoint in ("/changed-validator-range", "/missing-validator-range"):
+            with self.subTest(endpoint=endpoint), Server() as server, tempfile.TemporaryDirectory() as temporary:
+                downloads_root = Path(temporary) / "downloads"
+                book_root = downloads_root / "scope" / "book"
+                book_root.mkdir(parents=True)
+                destination = book_root / "0.audio"
+                part = book_root / "0.audio.part"
+                partial = FakeHandler.payload[:10]
+                part.write_bytes(partial)
+                metadata = book_root / "0.audio.part.json"
+                metadata.write_text(json.dumps({
+                    "validator": '"original"',
+                    "source": server.url + endpoint,
+                }))
+                result = run_mode("download", {
+                    "server": server.url,
+                    "url": server.url + endpoint,
+                    "downloadsRoot": str(downloads_root),
+                    "bookRoot": str(book_root),
+                    "destination": str(destination),
+                    "trackLimit": 2000,
+                    "bookLimit": 2000,
+                })
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(part.read_bytes(), partial)
+                self.assertFalse(destination.exists())
+                self.assertEqual(FakeHandler.requests[-1]["if_range"], '"original"')
+
+    def test_resume_200_response_replaces_partial(self):
+        with Server() as server, tempfile.TemporaryDirectory() as temporary:
+            downloads_root = Path(temporary) / "downloads"
+            book_root = downloads_root / "scope" / "book"
+            book_root.mkdir(parents=True)
+            destination = book_root / "0.audio"
+            part = book_root / "0.audio.part"
+            part.write_bytes(b"old-partial")
+            metadata = book_root / "0.audio.part.json"
+            metadata.write_text(json.dumps({
+                "validator": '"old"',
+                "source": server.url + "/ignore-range",
+            }))
+            result = run_mode("download", {
+                "server": server.url,
+                "url": server.url + "/ignore-range",
+                "downloadsRoot": str(downloads_root),
+                "bookRoot": str(book_root),
+                "destination": str(destination),
+                "trackLimit": 2000,
+                "bookLimit": 2000,
+            })
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(destination.read_bytes(), FakeHandler.payload)
+            self.assertFalse(part.exists())
+            completed_metadata = book_root / "0.audio.json"
+            self.assertEqual(json.loads(completed_metadata.read_text())["validator"], '"replacement"')
+            self.assertFalse(metadata.exists())
 
     def test_state_init_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:

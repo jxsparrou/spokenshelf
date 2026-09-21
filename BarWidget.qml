@@ -11,22 +11,61 @@ BarWidget {
   property bool popupOpen: false
   property string page: "home"
   property var pendingDeleteBook: null
+  property var pendingBookAction: null
+  property bool bookActionOpen: false
+  property bool confirmingPreparationCancel: false
 
   function close() {
     popupOpen = false
     pendingDeleteBook = null
     deleteConfirm.opened = false
+    pendingBookAction = null
+    bookActionOpen = false
+    confirmingPreparationCancel = false
   }
   function playBook(book, offline) {
     if (!service || !book) return
-    if (book._spokenShelfPartial) return
-    if (offline || service.isDownloaded(book.id)) service.playOffline(book.id, book._spokenShelfServer || "", book._spokenShelfUserId || "")
-    else service.playItem(book)
+    if (!book._spokenShelfPartial && (offline || service.isDownloaded(book.id))) {
+      service.playOffline(book.id, book._spokenShelfServer || "", book._spokenShelfUserId || "")
+      page = "player"
+      return
+    }
+    pendingBookAction = book
+    bookActionOpen = true
+  }
+  function closeBookAction() {
+    pendingBookAction = null
+    bookActionOpen = false
+  }
+  function streamPendingBook() {
+    var book = pendingBookAction
+    closeBookAction()
+    if (!service || !book) return
+    service.playItem(book)
     page = "player"
+  }
+  function downloadPendingBook() {
+    var book = pendingBookAction
+    closeBookAction()
+    if (service && book) service.prepareBookDownload(book)
   }
   function confirmDelete(book) {
     pendingDeleteBook = book
     deleteConfirm.opened = true
+  }
+  function confirmCancelDownload() {
+    if (!service) return
+    if (service.downloadPreparing) {
+      confirmingPreparationCancel = true
+      deleteConfirm.opened = true
+      return
+    }
+    if (!service.downloadItem) return
+    var book = Object.assign({}, service.downloadItem)
+    book._spokenShelfServer = service.downloadServer
+    book._spokenShelfUserId = service.downloadUserId
+    book._spokenShelfPartial = true
+    confirmDelete(book)
   }
 
   implicitWidth: button.implicitWidth
@@ -38,7 +77,9 @@ BarWidget {
     bar: root.bar
     text: "󰁧"
     active: root.popupOpen
-    tooltipText: root.service && root.service.title ? root.service.title : (root.service && root.service.connected ? "SpokenShelf" : "Connect SpokenShelf")
+    tooltipText: root.service && root.service.title ? root.service.title
+      : (root.service && root.service.connected ? "SpokenShelf"
+      : (root.service && root.service.restoringConnection ? "Connecting SpokenShelf" : "Connect SpokenShelf"))
 
     onPressed: function(mouseButton) {
       if (!root.service) return
@@ -52,7 +93,7 @@ BarWidget {
       if (opening && !root.service.connected) {
         var hasDownloads = Object.keys(root.service.offlineBooks).length > 0
         root.page = hasDownloads ? "offline" : "home"
-        if (!hasDownloads) root.service.promptForCredentials()
+        if (!hasDownloads && !root.service.restoringConnection) root.service.promptForCredentials()
       }
     }
   }
@@ -107,21 +148,34 @@ BarWidget {
             id: nowPlayingButton
             visible: root.service && root.service.currentItem
             iconText: root.service && root.service.isPlaying ? "󰏤" : "󰐊"
-            text: "Now playing"
+            text: root.service && root.service.isPlaying ? "Playing" : "Paused"
             foreground: root.bar.foreground
             onClicked: root.page = "player"
           }
 
           Button {
+            id: downloadActivityButton
+            visible: root.service && root.service.downloading
+            iconText: "󰇚"
+            text: root.service && root.service.downloadPreparing
+              ? "Preparing"
+              : Math.round((root.service ? root.service.downloadProgress : 0) * 100) + "%"
+            foreground: root.bar.foreground
+            onClicked: root.page = "offline"
+          }
+
+          Button {
             visible: root.service
             iconText: root.service && root.service.connected ? "󰍃" : "󰌾"
-            text: root.service && root.service.connected ? "Log out" : "Connect"
-            tooltipText: root.service && root.service.connected ? "Log out and switch server" : "Connect to a server"
-            enabled: root.service && !root.service.loggingOut
+            text: root.service && root.service.connected ? "Log out"
+              : (root.service && root.service.restoringConnection ? "Connecting..." : "Connect")
+            tooltipText: root.service && root.service.connected ? "Log out and switch server"
+              : (root.service && root.service.restoringConnection ? "Restoring saved login" : "Connect to a server")
+            enabled: root.service && !root.service.loggingOut && !root.service.restoringConnection
             foreground: root.bar.foreground
             onClicked: {
               if (root.service.connected) {
-                root.popupOpen = false
+                root.close()
                 root.service.logout(true)
               } else {
                 root.service.promptForCredentials()
@@ -156,6 +210,17 @@ BarWidget {
             onClicked: root.page = modelData.value
           }
         }
+      }
+
+      Text {
+        visible: root.service && root.service.restoringConnection
+        width: parent.width
+        text: "Restoring saved login..."
+        textFormat: Text.PlainText
+        color: root.bar.foreground
+        opacity: 0.72
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       Text {
@@ -319,8 +384,83 @@ BarWidget {
           visible: root.page === "offline"
           spacing: Style.space(8)
 
+          BorderSurface {
+            id: offlineDownloadProgress
+            visible: root.service && root.service.downloading
+            width: parent.width
+            height: downloadProgressContent.implicitHeight + Style.space(20)
+            radius: Style.cornerRadius
+            color: Style.normalFillFor(root.bar.foreground, Color.accent)
+            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+            Column {
+              id: downloadProgressContent
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(10)
+              spacing: Style.space(6)
+
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Column {
+                  width: parent.width - cancelDownloadButton.width - parent.spacing
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(2)
+
+                  Text {
+                    width: parent.width
+                    text: root.service && root.service.downloadPreparing
+                      ? root.service.downloadStatus
+                      : "Downloading " + (root.service ? root.service.downloadTitle : "")
+                    textFormat: Text.PlainText
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: root.service && root.service.downloadPreparing
+                      ? "Fetching book information..."
+                      : (root.service ? root.service.downloadProgressLabel : "")
+                    color: Qt.darker(root.bar.foreground, 1.35)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+
+                Button {
+                  id: cancelDownloadButton
+                  text: "Cancel"
+                  foreground: root.bar.foreground
+                  onClicked: root.confirmCancelDownload()
+                }
+              }
+
+              Rectangle {
+                width: parent.width
+                height: Style.space(5)
+                radius: height / 2
+                color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.18)
+
+                Rectangle {
+                  width: parent.width * (root.service ? root.service.downloadProgress : 0)
+                  height: parent.height
+                  radius: parent.radius
+                  color: root.bar.foreground
+                }
+              }
+            }
+          }
+
           Text {
-            visible: root.service && root.service.offlineBookList().length === 0
+            visible: root.service && !root.service.downloading && root.service.offlineBookList().length === 0
             text: "Downloaded books will appear here"
             color: Qt.darker(root.bar.foreground, 1.35)
             font.family: root.bar.fontFamily
@@ -329,7 +469,7 @@ BarWidget {
 
           ListView {
             width: parent.width
-            height: parent.height
+            height: parent.height - y
             clip: true
             spacing: Style.space(4)
             boundsBehavior: Flickable.StopAtBounds
@@ -686,6 +826,7 @@ BarWidget {
                 iconText: "󰇚"
                 text: root.service && root.service.currentDownloaded ? "Downloaded" : "Download"
                 enabled: root.service && !root.service.downloading && !root.service.currentDownloaded
+                  && root.service.downloadAllowed()
                 opacity: enabled ? 1 : 0.55
                 foreground: root.bar.foreground
                 onClicked: if (root.service) root.service.downloadBook()
@@ -701,17 +842,124 @@ BarWidget {
       anchors.fill: parent
       message: root.pendingDeleteBook && root.pendingDeleteBook._spokenShelfPartial
         ? "Cancel this download and remove its partial files?"
+        : root.confirmingPreparationCancel
+          ? "Cancel preparing this download?"
         : "Delete this downloaded book from this device? Listening progress will be kept."
-      confirmText: root.pendingDeleteBook && root.pendingDeleteBook._spokenShelfPartial ? "Cancel download" : "Delete download"
+      confirmText: root.confirmingPreparationCancel || (root.pendingDeleteBook && root.pendingDeleteBook._spokenShelfPartial)
+        ? "Cancel download" : "Delete download"
       onCanceled: {
         root.pendingDeleteBook = null
+        root.confirmingPreparationCancel = false
         opened = false
       }
       onConfirmed: {
         var book = root.pendingDeleteBook
+        var cancelPreparation = root.confirmingPreparationCancel
         root.pendingDeleteBook = null
+        root.confirmingPreparationCancel = false
         opened = false
-        if (root.service && book) root.service.deleteOfflineBook(book)
+        if (root.service && cancelPreparation) root.service.cancelActiveDownload()
+        else if (root.service && book) root.service.deleteOfflineBook(book)
+      }
+    }
+
+    Item {
+      id: bookActionDialog
+      anchors.fill: parent
+      visible: root.bookActionOpen
+      z: 100
+
+      Rectangle {
+        anchors.fill: parent
+        color: Util.alpha(Color.background, 0.78)
+      }
+
+      MouseArea {
+        anchors.fill: parent
+        onClicked: root.closeBookAction()
+      }
+
+      BorderSurface {
+        id: bookActionCard
+        anchors.centerIn: parent
+        width: Math.min(parent.width - Style.space(32), Style.space(370))
+        height: contentTopInset + contentBottomInset + bookActionContent.implicitHeight
+        radius: Style.cornerRadius
+        color: Color.background
+        borderSpec: Border.flat(Color.accent, Math.max(1, Style.normalBorderWidth))
+        padding: Style.space(18)
+
+        MouseArea { anchors.fill: parent }
+
+        Column {
+          id: bookActionContent
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          anchors.leftMargin: bookActionCard.contentLeftInset
+          anchors.rightMargin: bookActionCard.contentRightInset
+          spacing: Style.space(12)
+
+          Text {
+            width: parent.width
+            text: root.pendingBookAction && root.pendingBookAction.media && root.pendingBookAction.media.metadata
+              ? root.pendingBookAction.media.metadata.title || "Choose playback" : "Choose playback"
+            textFormat: Text.PlainText
+            color: Color.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            wrapMode: Text.WordWrap
+            maximumLineCount: 2
+            elide: Text.ElideRight
+          }
+
+          Text {
+            width: parent.width
+            text: "How would you like to listen?"
+            textFormat: Text.PlainText
+            color: Color.foreground
+            opacity: 0.72
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Button {
+              width: parent.width
+              iconText: "󰐊"
+              text: "Stream now"
+              enabled: root.service && root.service.connected
+              selected: true
+              bordered: true
+              foreground: Color.foreground
+              onClicked: root.streamPendingBook()
+            }
+
+            Button {
+              width: parent.width
+              iconText: "󰇚"
+              text: root.pendingBookAction && root.pendingBookAction._spokenShelfPartial ? "Resume download" : "Download"
+              enabled: root.service && root.service.downloadAllowed() && !root.service.downloading
+              bordered: true
+              foreground: Color.foreground
+              opacity: enabled ? 1 : 0.55
+              onClicked: root.downloadPendingBook()
+            }
+          }
+
+          Button {
+            width: parent.width
+            text: "Cancel"
+            foreground: Color.foreground
+            opacity: 0.78
+            onClicked: root.closeBookAction()
+          }
+        }
       }
     }
   }

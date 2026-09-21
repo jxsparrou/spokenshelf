@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jxsparrou.spokenshelf",
   "name": "SpokenShelf",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "jxSparrou",
   "description": "A native Omarchy player for streaming, downloading, and syncing Audiobookshelf books.",
   "license": "MIT",

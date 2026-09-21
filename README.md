@@ -79,7 +79,9 @@ Username and password credentials are sent only to the configured server's `/log
 
 - **Home** shows books in progress and recently added books.
 - **Library** lists all books and supports title, author, and series search.
+- Selecting an undownloaded book offers **Stream now** or **Download** before playback begins. Downloads continue in the background without creating a playback session, and interrupted partials can be resumed from the same chooser.
 - **Offline** lists downloaded books and active partial downloads. Use the trash action there to delete a download or cancel and remove a partial download.
+- Active download progress appears in Offline and in the panel header. Playback and download indicators remain independently available when both are active.
 - Selecting a downloaded book from any page prefers its local audio file.
 - Progress refreshes from the server when the panel opens and before playback resumes. Downloaded books upload queued offline listening before applying server progress when connected.
 - Resuming after at least 10 seconds paused rewinds playback by 5 seconds for context.

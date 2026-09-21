@@ -107,6 +107,10 @@ Item {
   property string pendingOfflineServer: ""
   property string pendingOfflineUserId: ""
   property bool stateReady: false
+  property bool restoringConnection: true
+  property bool downloadPreparing: false
+  property int downloadPreparationGeneration: 0
+  property bool stoppingDownloadForLogout: false
 
   signal credentialPromptStarting()
   signal credentialPromptUnavailable()
@@ -134,10 +138,12 @@ Item {
   readonly property string stateDirectory: Quickshell.env("HOME") + "/.local/state/omarchy-audiobookshelf"
   readonly property string transportPath: Qt.resolvedUrl("transport.py").toString().replace(/^file:\/\//, "")
   readonly property string serverName: server.replace(/^https?:\/\//, "").split("/")[0]
-  readonly property bool downloading: downloadProcess.running || downloadTrackIndex >= 0
+  readonly property bool downloading: downloadPreparing || downloadProcess.running || downloadTrackIndex >= 0
   readonly property bool currentDownloaded: currentItem && (localPlayback || isDownloaded(currentItem.id))
   readonly property real downloadProgress: downloadTotalBytes > 0 ? Math.min(downloadBytes / downloadTotalBytes, 1) : 0
   readonly property string downloadProgressLabel: Math.round(downloadProgress * 100) + "% - " + formatBytes(downloadBytes) + " / " + formatBytes(downloadTotalBytes)
+  readonly property string downloadTitle: downloadItem && downloadItem.media && downloadItem.media.metadata
+    ? String(downloadItem.media.metadata.title || "Untitled") : ""
 
   function apiUrl(path) { return server + path }
 
@@ -162,6 +168,22 @@ Item {
   function isDownloaded(itemId) {
     var entry = offlineEntry(itemId, server, user ? user.id : "")
     return entry !== null && !entry.partial
+  }
+
+  function isPartialDownload(itemId, itemServer, itemUserId) {
+    var entry = offlineEntry(itemId, itemServer || server, itemUserId || (user ? user.id : ""))
+    return entry !== null && !!entry.partial
+  }
+
+  function downloadAllowed() {
+    return connected && user && (!user.permissions || user.permissions.download !== false)
+  }
+
+  function isActiveDownload(item) {
+    if (!item || !downloadItem || item.id !== downloadItem.id) return false
+    var itemServer = String(item._spokenShelfServer || server)
+    var itemUserId = String(item._spokenShelfUserId || (user ? user.id : ""))
+    return itemServer === downloadServer && itemUserId === String(downloadUserId || "")
   }
 
   function offlineKey(itemId, itemServer, itemUserId) {
@@ -431,6 +453,7 @@ Item {
   }
 
   function authenticateWithToken(serverUrl, apiToken, method) {
+    restoringConnection = false
     selectServer(serverUrl)
     token = String(apiToken || "").trim()
     connected = false
@@ -441,6 +464,7 @@ Item {
   }
 
   function authenticateWithPassword(serverUrl, username, password) {
+    restoringConnection = false
     selectServer(serverUrl)
     token = ""
     connected = false
@@ -487,6 +511,7 @@ Item {
   }
 
   function promptForCredentials() {
+    if (restoringConnection) return
     if (credentialPrompt.running) return
     if (!zenityChecked) {
       credentialPromptPending = true
@@ -524,6 +549,7 @@ Item {
     loading = true
     request("GET", "/api/me", null, function(ok, data) {
       loading = false
+      restoringConnection = false
       if (!ok) {
         connected = false
         tokenToStore = ""
@@ -552,6 +578,7 @@ Item {
 
   function logout(promptForNewServer) {
     if (loggingOut) return
+    restoringConnection = false
     loggingOut = true
     promptAfterLogout = Boolean(promptForNewServer)
     requestQueue = []
@@ -627,6 +654,15 @@ Item {
     playbackGeneration += 1
     playbackStartPending = false
     streamStartPending = false
+    downloadPreparationGeneration += 1
+    downloadPreparing = false
+    if (downloadProcess.running) {
+      stoppingDownloadForLogout = true
+      downloadProcess.running = false
+    } else if (downloadItem && !pendingDeletion) {
+      downloadStatus = "Download paused after logout"
+      resetDownloadState()
+    }
     mediaProxyReady = false
     mediaProxyPort = 0
     mediaProxyCapability = ""
@@ -1165,12 +1201,60 @@ Item {
   }
 
   function downloadBook() {
-    if (!currentItem || currentTracks.length === 0 || currentDownloaded) return
-    var itemId = safeItemId(currentItem.id)
+    if (!currentItem || currentTracks.length === 0 || currentDownloaded || !downloadAllowed()) return
+    startBookDownload(currentItem, currentTracks, currentChapters)
+  }
+
+  function prepareBookDownload(item) {
+    if (!item || !item.id || downloading) return
+    if (!downloadAllowed()) { error = "This account does not allow downloads"; return }
+    var itemId = safeItemId(item.id)
     if (itemId === "") { error = "The server returned an unsafe item ID"; return }
-    downloadItem = currentItem
-    downloadTracks = currentTracks.slice()
-    downloadChapters = currentChapters.slice()
+    downloadPreparing = true
+    downloadStatus = "Preparing " + (item.media && item.media.metadata ? item.media.metadata.title || "download" : "download")
+    downloadPreparationGeneration += 1
+    var generation = downloadPreparationGeneration
+    var preparationServer = server
+    var preparationUserId = user ? String(user.id || "") : ""
+    request("GET", "/api/items/" + encodeURIComponent(item.id) + "?expanded=1", null, function(ok, data) {
+      if (generation !== downloadPreparationGeneration) return
+      downloadPreparing = false
+      if (server !== preparationServer || !user || String(user.id || "") !== preparationUserId) return
+      if (!ok) { downloadStatus = ""; error = data; return }
+      if (!data || typeof data !== "object" || data.id !== item.id || !data.media || typeof data.media !== "object") {
+        downloadStatus = ""
+        error = "The server returned invalid download metadata"
+        return
+      }
+      var tracks = Array.isArray(data.media.tracks) ? data.media.tracks : []
+      var chapters = Array.isArray(data.media.chapters) ? data.media.chapters : []
+      if (tracks.length === 0 || tracks.length > 10000 || chapters.length > 10000) {
+        downloadStatus = ""
+        error = "The server returned invalid download tracks"
+        return
+      }
+      var validTracks = []
+      for (var i = 0; i < tracks.length; i++) {
+        if (!tracks[i] || typeof tracks[i] !== "object" || typeof tracks[i].contentUrl !== "string"
+            || trustedMediaUrl(tracks[i].contentUrl, preparationServer) === "") {
+          downloadStatus = ""
+          error = "The server returned an unsafe download track"
+          return
+        }
+        validTracks.push(tracks[i])
+      }
+      startBookDownload(data, validTracks, chapters.length > 0 ? chapters : chaptersFromTracks(validTracks))
+    })
+  }
+
+  function startBookDownload(item, tracks, chapters) {
+    if (!downloadAllowed() || !item || !Array.isArray(tracks) || tracks.length === 0
+        || downloadProcess.running || downloadTrackIndex >= 0) return
+    var itemId = safeItemId(item.id)
+    if (itemId === "") { error = "The server returned an unsafe item ID"; return }
+    downloadItem = item
+    downloadTracks = tracks.slice()
+    downloadChapters = Array.isArray(chapters) ? chapters.slice() : []
     downloadServer = server
     downloadToken = token
     downloadUserId = user ? user.id : ""
@@ -1183,7 +1267,7 @@ Item {
     }
     offlineBooks = partials
     offlineIndex.setText(JSON.stringify(offlineBooks, null, 2) + "\n")
-    downloadStatus = "Downloading " + title
+    downloadStatus = "Downloading " + downloadTitle
     downloadBytes = 0
     downloadCompletedBytes = 0
     downloadTotalBytes = 0
@@ -1193,6 +1277,21 @@ Item {
     }
     downloadTrackIndex = 0
     downloadTrack()
+  }
+
+  function cancelActiveDownload() {
+    if (downloadPreparing) {
+      downloadPreparationGeneration += 1
+      downloadPreparing = false
+      downloadStatus = "Download canceled"
+      return
+    }
+    if (!downloadItem) return
+    var item = Object.assign({}, downloadItem)
+    item._spokenShelfServer = downloadServer
+    item._spokenShelfUserId = downloadUserId
+    item._spokenShelfPartial = true
+    deleteOfflineBook(item)
   }
 
   function downloadTrack() {
@@ -1278,7 +1377,7 @@ Item {
     if (itemId === "") { error = "Cannot delete a download with an unsafe item ID"; return }
     pendingDeletion = {
       key: offlineKeyForBook(book), itemId: itemId, server: itemServer, userId: itemUserId,
-      bookRoot: downloadDirectory(itemId, itemServer, itemUserId)
+      bookRoot: downloadDirectory(itemId, itemServer, itemUserId), wasPartial: !!book._spokenShelfPartial
     }
     if (pendingOfflineItemId === book.id && pendingOfflineServer === itemServer && pendingOfflineUserId === itemUserId) {
       playbackGeneration += 1
@@ -1679,7 +1778,10 @@ Item {
       onStreamFinished: {
         if (root.loggingOut) return
         root.token = String(text || "").trim()
-        if (root.token === "") root.error = "Not connected"
+        if (root.token === "") {
+          root.restoringConnection = false
+          root.error = "Not connected"
+        }
         else {
           root.authenticationMethod = "keyring"
           root.authorize()
@@ -1688,7 +1790,10 @@ Item {
     }
     onExited: function(code) {
       if (root.loggingOut) return
-      if (code !== 0) root.error = "Not connected"
+      if (code !== 0) {
+        root.restoringConnection = false
+        root.error = "Not connected"
+      }
     }
   }
 
@@ -1751,6 +1856,8 @@ Item {
       return JSON.stringify({
         server: root.server,
         connected: root.connected,
+        restoringConnection: root.restoringConnection,
+        stateReady: root.stateReady,
         authenticationMethod: root.authenticationMethod,
         loading: root.loading,
         error: root.error,
@@ -1835,6 +1942,8 @@ Item {
     stdout: SplitParser { onRead: function(line) { root.handleDownloadEvent(line) } }
     stderr: StdioCollector { id: downloadError; waitForEnd: true }
     onExited: function(code) {
+      var stoppedForLogout = root.stoppingDownloadForLogout
+      root.stoppingDownloadForLogout = false
       if (root.pendingDeletion && root.downloadItem
           && root.pendingDeletion.itemId === root.downloadItem.id
           && root.pendingDeletion.server === root.downloadServer
@@ -1843,6 +1952,12 @@ Item {
         root.beginPendingDeletion()
         return
       }
+      if (stoppedForLogout) {
+        root.downloadStatus = "Download paused after logout"
+        root.resetDownloadState()
+        return
+      }
+      if (!root.downloadItem || root.downloadTrackIndex < 0) return
       if (code !== 0) {
         root.downloadStatus = "Download failed: " + (root.downloadProcessError || String(downloadError.text || "unknown error").trim())
         root.resetDownloadState()
@@ -1886,7 +2001,7 @@ Item {
         if (deletion.key !== "") delete next[deletion.key]
         root.offlineBooks = next
         offlineIndex.setText(JSON.stringify(root.offlineBooks, null, 2) + "\n")
-        root.downloadStatus = "Deleted local download"
+        root.downloadStatus = deletion.wasPartial ? "Download canceled" : "Deleted local download"
       } else {
         root.error = "Could not delete download: " + (root.deleteProcessError || String(deleteError.text || "unknown error").trim())
       }
@@ -1896,7 +2011,6 @@ Item {
 
   FileView {
     id: offlineIndex
-    preload: false
     path: root.stateReady ? root.stateDirectory + "/downloads.json" : ""
     printErrors: false
     onLoaded: {
@@ -1907,7 +2021,6 @@ Item {
 
   FileView {
     id: offlineSessionsFile
-    preload: false
     path: root.stateReady ? root.stateDirectory + "/offline-sessions.json" : ""
     printErrors: false
     onLoaded: {
@@ -1918,13 +2031,14 @@ Item {
 
   FileView {
     id: serverFile
-    preload: false
     path: root.stateReady ? root.stateDirectory + "/server-url" : ""
     printErrors: false
     onLoaded: {
       var savedServer = Api.normalizeServer(text())
       if (savedServer !== "") root.connect(savedServer)
+      else root.restoringConnection = false
     }
+    onLoadFailed: root.restoringConnection = false
   }
 
   Component.onCompleted: {
@@ -1950,11 +2064,12 @@ Item {
       payload = ""
     }
     onExited: function(code) {
-      if (code !== 0) { root.error = "Could not initialize SpokenShelf's private state directory"; return }
+      if (code !== 0) {
+        root.restoringConnection = false
+        root.error = "Could not initialize SpokenShelf's private state directory"
+        return
+      }
       root.stateReady = true
-      offlineIndex.reload()
-      offlineSessionsFile.reload()
-      serverFile.reload()
     }
   }
 
