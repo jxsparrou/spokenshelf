@@ -743,6 +743,7 @@ BarWidget {
             Text {
               width: parent.width
               text: root.service ? root.service.downloadStatus : ""
+              textFormat: Text.PlainText
               visible: text !== ""
               color: root.bar.foreground
               font.family: root.bar.fontFamily
